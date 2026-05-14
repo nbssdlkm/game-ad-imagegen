@@ -47,7 +47,11 @@ fi
 echo ""
 echo "==> Verifying dependencies"
 if ! command -v python >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
-  echo "    ! Python not found. Install Python 3.10+"
+  echo "    ! Python not found. Install Python 3.10+ then re-run ./install.sh"
+  echo "      macOS:        brew install python@3.12   (or: https://www.python.org/downloads/)"
+  echo "      Ubuntu/Debian: sudo apt install python3 python3-pip"
+  echo "      Fedora/RHEL:   sudo dnf install python3 python3-pip"
+  echo "      Arch:          sudo pacman -S python python-pip"
   exit 1
 fi
 PY="$(command -v python3 || command -v python)"

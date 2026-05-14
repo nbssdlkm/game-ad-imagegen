@@ -59,8 +59,24 @@ Write-Host ""
 Write-Host "==> Verifying dependencies" -ForegroundColor Cyan
 $py = Get-Command python -ErrorAction SilentlyContinue
 if (-not $py) {
-  Write-Host "    ! Python not found on PATH. Install Python 3.10+ first." -ForegroundColor Red
-  exit 1
+  Write-Host "    Python not found — attempting auto-install via winget..." -ForegroundColor Yellow
+  $winget = Get-Command winget -ErrorAction SilentlyContinue
+  if (-not $winget) {
+    Write-Host "    ! winget not available either. Install Python 3.10+ manually:" -ForegroundColor Red
+    Write-Host "      Option 1: https://www.python.org/downloads/  (download installer, check 'Add to PATH')"
+    Write-Host "      Option 2: Open Microsoft Store, search 'Python 3.12', install"
+    Write-Host "      Then close PowerShell, reopen, and re-run .\install.ps1"
+    exit 1
+  }
+  winget install --id Python.Python.3.12 --silent --accept-package-agreements --accept-source-agreements
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host "    ! winget install failed. Install Python 3.10+ manually from https://www.python.org/downloads/" -ForegroundColor Red
+    exit 1
+  }
+  Write-Host "    Python installed via winget." -ForegroundColor Green
+  Write-Host "    ⚠ Close this PowerShell window, open a new one, then re-run .\install.ps1" -ForegroundColor Yellow
+  Write-Host "      (PATH won't refresh in the current session)"
+  exit 0
 }
 $pyVer = (python --version) 2>&1
 Write-Host "    Python: $pyVer"
