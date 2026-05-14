@@ -312,28 +312,33 @@ def main():
         )
 
         if skip_rewrite or args.dry_run:
-            rewritten_prompt = prompt
+            rewritten_prompts = [prompt] * n
             if skip_rewrite and not args.dry_run:
-                print(f"\n[task {task_id}] skip rewrite (prompt_already_rewritten / --no-rewrite)", flush=True)
+                print(f"\n[task {task_id}] skip rewrite (prompt_already_rewritten / --no-rewrite), reusing original × {n}", flush=True)
         else:
-            print(f"\n[task {task_id}] vision + rewrite step ({len(refs)} refs)...", flush=True)
+            print(f"\n[task {task_id}] vision + rewrite step ({len(refs)} refs, n={n})...", flush=True)
             try:
                 sys.path.insert(0, str(Path(__file__).parent))
                 from rewrite_prompt import rewrite as _do_rewrite
-                rewritten_prompt = _do_rewrite(prompt, refs)
+                rewritten_prompts = _do_rewrite(prompt, refs, n=n)
                 # 存原始中文 prompt 作 debug trail
                 (out_dir / f"{task_id}_prompt_original.txt").write_text(prompt, encoding="utf-8")
-                print(f"[task {task_id}] rewrite done ({len(rewritten_prompt)} chars)", flush=True)
+                total_chars = sum(len(p) for p in rewritten_prompts)
+                print(f"[task {task_id}] rewrite done ({len(rewritten_prompts)} prompts, {total_chars} chars total)", flush=True)
             except Exception as e:
                 print(f"! [task {task_id}] rewrite failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-                print(f"  falling back to original prompt — image quality may suffer", file=sys.stderr, flush=True)
-                rewritten_prompt = prompt
+                print(f"  falling back to original prompt × {n} — image quality may suffer", file=sys.stderr, flush=True)
+                rewritten_prompts = [prompt] * n
 
-        prompt_file = out_dir / f"{task_id}_prompt.txt"
-        prompt_file.write_text(rewritten_prompt, encoding="utf-8")
+        # 兜底:确保 len == n(rewrite 内部应已保证,这里 belt-and-suspenders)
+        while len(rewritten_prompts) < n:
+            rewritten_prompts.append(rewritten_prompts[-1])
 
         for i in range(1, n + 1):
             img_seq += 1
+            # 每张图独立 prompt_file(对应这次 sampling 的那段 rewrite，N 段不同角色多样性)
+            prompt_file = out_dir / f"{task_id}_{i:02d}_prompt.txt"
+            prompt_file.write_text(rewritten_prompts[i - 1], encoding="utf-8")
             out_path = out_dir / f"{task_id}_{i:02d}.png"
             meta_path = out_dir / f"{task_id}_{i:02d}_meta.json"
             print(f"\n--- {img_seq}/{n_images_total}  ({task_id} {i}/{n}) ---", flush=True)
