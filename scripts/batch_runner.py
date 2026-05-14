@@ -262,6 +262,9 @@ def main():
             errors.append(f"{tid}: anchor_candidates={M_anchor} 超过上限 10 (太多候选浪费 token)")
         if M_anchor >= 2 and n < 2:
             errors.append(f"{tid}: anchor_candidates={M_anchor} (≥2) 但 n={n} (<2); anchor mode 需要 n>=2 才能产 N-1 张 series; 改 n>=2 或删 anchor_candidates")
+        # anchor mode 需要 ≥1 张参考图(Phase 3 把 picked anchor 作 ref,Phase 1 也要 vision)
+        if M_anchor >= 2 and len(refs) == 0:
+            errors.append(f"{tid}: anchor_candidates={M_anchor} 需要 ≥1 张参考图 (0 图 text2im 不支持 anchor workflow)")
 
     if errors:
         print(f"\n! 校验失败 ({len(errors)} 个问题):", file=sys.stderr)
