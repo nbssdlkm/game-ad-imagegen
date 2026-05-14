@@ -190,6 +190,41 @@ Quality and style requirements:
 
 ---
 
+### Step 4.5（可选）: 只转写不出图模式
+
+如果用户明确说"只转写不出图" / "只要 prompt 不要图" / "给我 prompt 我自己拿" / "先看看 rewrite 的结果" → 走完 Step 1-4(vision + 拆解 + 角色 + rewrite),**跳过 Step 5**,把 Step 4 写好的 rewritten prompt **直接在对话区用 markdown fenced 代码块输出**,让 user 用 WorkBuddy / Claude Code 自带的"复制代码"按钮一键拿走。
+
+**不消耗 image_gen credit**,适合:
+- 用户想先看 rewritten prompt 决定要不要花 credit 跑
+- 用户想拿 prompt 去别的工具(其他 image gen API / 备忘 / 二次微调)
+- 调试:用户改 prompt → 粘回 batch_form 跑
+
+输出格式(直接打字在对话区,不开 HTML / 不开 browser / 不调脚本):
+
+````markdown
+转写好了。以下是你的 rewritten prompt(对话框右上角「复制」按钮一键复制):
+
+```text
+<这里贴完整 rewritten prompt — 不要任何 ```text 之外的额外缩进 / 标记>
+```
+
+如果要真出图,把这段粘到 batch_form 的「中文需求 prompt」框 + 配上参考图,再回来跟我说"跑 batch_xxx"。
+````
+
+⚠️ **关键 invariants**：
+- 用 \`\`\`text(不是 \`\`\`json / \`\`\`bash,避免 WorkBuddy 误识别成可执行代码)
+- 代码块内**只放 prompt 字面**,不加 commentary / 不加 "Step 4 输出:" / 不加 prefix
+- 一段 prompt 一个代码块。如果 Step 4 出了 N 段(多张图),N 个独立代码块,每段开头一行 `### prompt for image #<i>` 标号
+- **不要省略**,不要 truncate,不要写"..."。完整复制给 user
+
+⚠️ **触发词列表**：用户说以下任一,即走本模式不进 Step 5：
+- "只转写"、"只 rewrite"、"先 rewrite 看看"
+- "不要出图,给我 prompt"、"只要 prompt"
+- "rewrite only"、"prompt only"、"先别跑"
+- "把 prompt 给我"、"prompt 复制给我"、"prompt 写好发我"
+
+---
+
 ### Step 5: 图像生成（调 skill 提供的工具）
 
 **第 1 次调用**：
