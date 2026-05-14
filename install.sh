@@ -53,7 +53,12 @@ fi
 PY="$(command -v python3 || command -v python)"
 echo "    Python: $($PY --version 2>&1)"
 if ! $PY -c "import openai" >/dev/null 2>&1; then
-  echo "    ! openai SDK missing. Install: pip install openai"
+  echo "    openai SDK missing — installing now ($PY -m pip install --user openai)..."
+  if ! $PY -m pip install --user --quiet openai; then
+    echo "    ! pip install failed. Run manually: $PY -m pip install --user openai"
+    exit 1
+  fi
+  echo "    openai SDK installed: $($PY -c 'import openai; print(openai.__version__)')"
 else
   echo "    openai SDK: $($PY -c 'import openai; print(openai.__version__)')"
 fi

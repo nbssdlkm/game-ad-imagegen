@@ -84,6 +84,5 @@ game-ad-imagegen/
 
 ## 依赖
 
-- Python 3.10+
-- `openai` SDK(`pip install openai`)
-- 一个 OpenAI 兼容 API key(ephone / OpenAI 官方 / 其他代理皆可)
+- **Python 3.10+** —— 唯一要你手装的(`install.ps1` 会自动 `pip install --user openai`,设计师不用懂 pip)
+- **OpenAI 兼容 API key**(ephone / OpenAI 官方 / 任意代理) —— 首次跑时 agent 会问你贴一次,写到 `~/.config/game-ad-imagegen/config.toml`,以后不再问

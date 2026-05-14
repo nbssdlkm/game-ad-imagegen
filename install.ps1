@@ -67,7 +67,15 @@ Write-Host "    Python: $pyVer"
 
 $openai = python -c "import openai; print(openai.__version__)" 2>&1
 if ($LASTEXITCODE -ne 0) {
-  Write-Host "    ! openai SDK missing. Install with: pip install openai" -ForegroundColor Red
+  Write-Host "    openai SDK missing — installing now (pip install --user openai)..." -ForegroundColor Yellow
+  python -m pip install --user --quiet openai
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host "    ! pip install failed. Run manually:" -ForegroundColor Red
+    Write-Host "      python -m pip install --user openai"
+    exit 1
+  }
+  $openai = python -c "import openai; print(openai.__version__)" 2>&1
+  Write-Host "    openai SDK installed: $openai" -ForegroundColor Green
 } else {
   Write-Host "    openai SDK: $openai"
 }
