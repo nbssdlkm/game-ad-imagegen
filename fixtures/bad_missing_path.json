@@ -1,0 +1,15 @@
+{
+  "batch_id": "fixture_bad_missing_path",
+  "skill": "a",
+  "out_dir": "~/Desktop/game-ad-imagegen-out/fixture_bad_missing_path/",
+  "size": "1536x1024",
+  "quality": "medium",
+  "tasks": [
+    {
+      "task_id": "t01",
+      "reference_images": ["./not_exists/nowhere.png"],
+      "prompt": "测试:A 的 runner 应该 reject 不存在的图片路径并报出哪个文件缺失",
+      "n": 1
+    }
+  ]
+}

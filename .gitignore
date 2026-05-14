@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+.vscode/
+
+# 跑 fixtures 时会在 ~/Desktop/game-ad-imagegen-out/ 产出图片,不入 repo
+# 也忽略开发者本地 outputs/
+outputs/
+
+# config.toml 是用户本地 key,绝对不入 repo
+config.toml
+.config/
+
+# 本地批次 config(用户配的 batch.json 在 Downloads,不入 repo)
+batch_*.json
+
+# launch_detached.py 在 scripts/ 内 append 写的 batch_runner log
+scripts/*_detached_launcher.log

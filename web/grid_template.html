@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>批量出图 — __BATCH_ID__ (__STATUS__)</title>
+<!-- 跑批中(__STATUS__ == 'running')每 5s 自动刷新看新出的图;done 后不再刷新 -->
+__AUTO_REFRESH_META__
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: "Microsoft YaHei", "PingFang SC", -apple-system, system-ui, sans-serif;
+    margin: 0; padding: 20px; background: #1f1f23; color: #d7d7da; line-height: 1.55;
+  }
+  header { margin-bottom: 16px; border-bottom: 1px solid #3a3a40; padding-bottom: 12px; }
+  h1 { margin: 0 0 6px; font-size: 20px; color: #fff; }
+  .meta { font-size: 12.5px; color: #999; }
+  .meta code { background: #2c2c30; padding: 1px 5px; border-radius: 3px; color: #d7d7da; font-size: 12px; }
+  .status-badge { display:inline-block; font-size:11px; padding:2px 8px; border-radius:10px; margin-left:6px; vertical-align:middle; }
+  .status-running { background:#3a3f72; color:#aab8ff; }
+  .status-done { background:#2a5a2a; color:#a8e0a8; }
+  .status-error { background:#5a2a2a; color:#f0a8a8; }
+  .progress-bar {
+    margin-top: 8px; background: #2c2c30; border-radius: 3px; overflow: hidden; height: 6px;
+  }
+  .progress-fill {
+    background: linear-gradient(90deg, #6a7df6, #8b9af8); height: 100%; transition: width .4s;
+  }
+  .task-block { margin: 22px 0; padding: 12px 14px; background: #2a2a2f; border-radius: 6px; }
+  .task-head { font-size: 15px; color: #fff; margin-bottom: 4px; }
+  .task-prompt {
+    font-size: 12px; color: #aaa; margin: 0 0 10px; max-height: 60px; overflow: hidden; cursor: pointer;
+    transition: max-height .25s;
+  }
+  .task-prompt.open { max-height: 800px; }
+  .task-prompt::after { content: " (点击展开)"; color: #6a7df6; }
+  .task-prompt.open::after { content: " (点击收起)"; }
+  .task-refs { font-size: 11px; color: #777; margin-bottom: 10px; }
+  .task-refs code { background: #1e1e22; padding: 1px 4px; border-radius: 2px; color: #aaa; }
+  .grid {
+    display: grid;
+    /* 自适应行列,不 hardcode 几列。每格 minmax(280px, 1fr),屏幕宽就多几列,窄就少几列 */
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 12px;
+  }
+  .cell {
+    background: #1e1e22; border: 1px solid #3a3a40; border-radius: 5px; overflow: hidden;
+  }
+  .cell img { display: block; width: 100%; height: auto; background: #000; }
+  .cell .caption {
+    padding: 6px 9px; font-size: 11.5px; color: #aaa;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .cell .caption strong { color: #d7d7da; }
+  .cell.error img { display: none; }
+  .cell.error .caption { background: #4a2828; color: #f0a0a0; }
+  .cell.pending {
+    border-style: dashed; opacity: .55;
+    min-height: 160px; display:flex; align-items:center; justify-content:center;
+    color: #6a7df6; font-size: 12px;
+  }
+  .cell .open-link { color: #6a7df6; text-decoration: none; font-size: 11px; }
+  .cell .open-link:hover { text-decoration: underline; }
+  .summary { margin-top: 18px; font-size: 12.5px; color: #888; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>批量出图 <span style="color:#6a7df6">__BATCH_ID__</span> <span class="status-badge status-__STATUS__">__STATUS_LABEL__</span></h1>
+  <p class="meta">
+    出图目录 <code>__OUT_DIR__</code> ·
+    skill = <strong>__SKILL_LABEL__</strong> ·
+    进度 <span id="completed">__COMPLETED__</span> / <span>__TOTAL__</span>
+    (成功 <span id="ok-count">__OK_COUNT__</span>) ·
+    耗时 __ELAPSED__s
+  </p>
+  <div class="progress-bar">
+    <div class="progress-fill" style="width: __PROGRESS_PCT__%"></div>
+  </div>
+</header>
+
+<main id="results">
+  __TASK_BLOCKS__
+</main>
+
+<p class="summary">
+  __STATUS_HINT__
+</p>
+
+<script>
+  document.querySelectorAll('.task-prompt').forEach((el) => {
+    el.addEventListener('click', () => el.classList.toggle('open'));
+  });
+</script>
+
+</body>
+</html>

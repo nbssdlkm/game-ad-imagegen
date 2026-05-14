@@ -1,0 +1,15 @@
+{
+  "batch_id": "fixture_bad_empty_refs",
+  "skill": "a",
+  "out_dir": "~/Desktop/game-ad-imagegen-out/fixture_bad_empty_refs/",
+  "size": "1536x1024",
+  "quality": "medium",
+  "tasks": [
+    {
+      "task_id": "t01",
+      "reference_images": [],
+      "prompt": "测试:A skill 应该 reject 0 图请求并提示去 B skill",
+      "n": 1
+    }
+  ]
+}

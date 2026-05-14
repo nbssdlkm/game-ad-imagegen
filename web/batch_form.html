@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>批量出图配置 — skill A (game-ad-imagegen)</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  .skill-badge { display:inline-block; font-size:12px; padding:2px 9px; border-radius:10px; margin-left:8px; vertical-align:middle; font-weight:normal; }
+  .skill-badge.skill-a { background:#dde7ff; color:#2a3ea0; border:1px solid #b3c4ed; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>批量出图配置 <span class="skill-badge skill-a">skill A · game-ad-imagegen</span></h1>
+  <p class="hint">填好后点底部「生成跑批指令」,会下载一个 JSON + 复制到剪贴板,回对话区说<code>跑 batch_&lt;时间戳&gt;</code> 或直接粘贴 JSON 就开跑。</p>
+  <p class="hint" style="margin-top:6px;color:#996c1a">⚠️ 本表单专属 A skill (<code>game-ad-imagegen</code>),生成的 config.json 自带 <code>skill: "a"</code> 字段。<strong>每个任务必须 ≥ 1 张参考图</strong>(不支持纯文字生图)。要纯文字生图请改用 B skill 的 batch_form。</p>
+</header>
+
+<section class="global">
+  <div class="row">
+    <label>批次 ID</label>
+    <input type="text" id="batch_id" readonly>
+    <span class="hint inline">自动生成,对话区识别用</span>
+  </div>
+  <div class="row">
+    <label>保存到哪个文件夹</label>
+    <input type="text" id="out_root" value="" placeholder="例如 D:/我的素材/广告图/  或留空使用桌面" size="50">
+    <span class="hint inline">每次跑会建 <code>&lt;批次 ID&gt;/</code> 子目录;<strong>留空</strong>则默认保存到 <code>桌面/game-ad-imagegen-out/</code></span>
+  </div>
+  <div class="row">
+    <label>默认尺寸</label>
+    <select id="default_size">
+      <option value="1536x1024" selected>1536×1024 横版 (推荐)</option>
+      <option value="1024x1536">1024×1536 竖版 (9:16 风格)</option>
+      <option value="1024x1024">1024×1024 正方</option>
+      <option value="auto">auto (让模型自己选)</option>
+    </select>
+    <label style="margin-left:18px">默认质量</label>
+    <select id="default_quality">
+      <option value="low">low (快，省 token)</option>
+      <option value="medium" selected>medium (平衡)</option>
+      <option value="high">high (慢，质量好)</option>
+    </select>
+    <span class="hint inline">每任务可单独 override</span>
+  </div>
+</section>
+
+<section class="tasks">
+  <h2>任务列表</h2>
+  <div id="task_list"></div>
+  <button type="button" id="btn_add" class="btn-secondary">+ 添加任务</button>
+</section>
+
+<section class="actions">
+  <button type="button" id="btn_generate" class="btn-primary">生成跑批指令</button>
+</section>
+
+<section class="output" id="output_box" style="display:none">
+  <h2>跑批指令已就绪</h2>
+  <div class="actions-row">
+    <button type="button" id="btn_copy" class="btn-secondary">复制到剪贴板</button>
+    <a id="btn_download" class="btn-secondary" href="#" download="config.json">下载 config.json</a>
+    <span id="status_msg" class="status"></span>
+  </div>
+  <p class="next">
+    回 WorkBuddy 对话区，<strong>三种触发方式任选一</strong>：
+  </p>
+  <ol>
+    <li>说 <code id="trigger_phrase">跑 batch_xxx</code>（最简，agent 自己找 config）</li>
+    <li>把下载的 <code>config.json</code> 拖到对话区</li>
+    <li>把下面 JSON 整段粘贴到对话区</li>
+  </ol>
+  <pre id="json_preview"></pre>
+</section>
+
+<template id="task_template">
+  <div class="task-card" data-task-idx="">
+    <div class="task-head">
+      <span class="task-id"></span>
+      <button type="button" class="btn-del">删除</button>
+    </div>
+    <div class="row">
+      <label>图片（每行一条，1-N 张）</label>
+      <textarea class="reference_images" rows="4" placeholder="每行一条图片路径(必须 ≥1 张)。例如:&#10;D:/我的素材/参考图1.png&#10;D:/我的素材/参考图2.png"></textarea>
+      <span class="hint inline" style="margin-top:4px">顺序按你 prompt 里"图1/图2/图3"对应的来 — 每张图的角色(参考/素材/叠加)写在 prompt 里。</span>
+    </div>
+    <div class="row">
+      <label>中文需求 prompt</label>
+      <textarea class="prompt" rows="4" placeholder="比如:把图1的UI和文字、图3的头像,合成到图2的主场景..."></textarea>
+      <span class="hint inline" style="margin-top:4px;color:#b8860b">⚠️ <strong>不要在 prompt 里写"出N张"</strong>(如"生成5张")— 否则模型会把多张拼成1张 PNG 拼图。数量由下面"出图数"控制,prompt 保持<strong>单数描述</strong>("做一张...")。</span>
+      <span class="hint inline" style="margin-top:4px;color:#b8860b">⚠️ <strong>图里的每个文字位都要明示</strong> — 主标题/副标题/角色名牌/CTA 按钮分别写啥(用引号原文),没说的位置 GPT 会凭训练先验编个看起来"合理"但跟图不符的字。不需要的位置明说"留空"。</span>
+    </div>
+    <div class="row">
+      <label>出图数</label>
+      <input type="number" class="n" min="1" max="10" value="1" style="width:60px">
+      <span class="hint inline" style="margin-left:8px;color:#666">填几就独立跑几次,每次出 1 张 PNG</span>
+      <label style="margin-left:18px">尺寸 override</label>
+      <select class="size_override">
+        <option value="">跟随默认</option>
+        <option value="1536x1024">1536×1024 横版</option>
+        <option value="1024x1536">1024×1536 竖版</option>
+        <option value="1024x1024">1024×1024 正方</option>
+        <option value="auto">auto</option>
+      </select>
+      <label style="margin-left:18px">质量 override</label>
+      <select class="quality_override">
+        <option value="">跟随默认</option>
+        <option value="low">low</option>
+        <option value="medium">medium</option>
+        <option value="high">high</option>
+      </select>
+    </div>
+  </div>
+</template>
+
+<script src="batch_form.js"></script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+{
+  "batch_id": "fixture_bad_wrong_skill",
+  "skill": "b",
+  "out_dir": "~/Desktop/game-ad-imagegen-out/fixture_bad_wrong_skill/",
+  "size": "1536x1024",
+  "quality": "medium",
+  "tasks": [
+    {
+      "task_id": "t01",
+      "reference_images": ["./fixtures/sample_ref.png"],
+      "prompt": "测试:A 的 runner 应该 reject skill='b' 并提示用 B 的 runner",
+      "n": 1
+    }
+  ]
+}

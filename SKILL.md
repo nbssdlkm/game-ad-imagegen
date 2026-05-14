@@ -1,0 +1,491 @@
+---
+name: game-ad-imagegen
+description: |
+  生成**游戏买量广告图 / 海报 / 买量素材**(特化场景)。当用户提供「爆款参考图 + 实机图 + 中文 prompt」请你做 N 张游戏广告系列图时使用。
+  模拟网页版 ChatGPT 的"对话模型 → image_gen.text2im"工作流,按 6 步流程产出 N 张高质量横版广告图(默认 1536x1024 = gpt-image-2 合法 landscape)。
+  题材无关 / 角色无关:所有视觉特征由 vision call 从用户提供的参考图与实机图自动识别,skill 本体不预设任何题材或角色。**必须 ≥1 张参考图**(0 图纯文字生图请走 codex-imagegen-fork)。
+  **跟 `codex-imagegen-fork` (B skill) 的差异化**:A 专做游戏买量广告(爆款复刻 + 多张系列 + 6 步 vision 工作流);B 做通用图片任务(单图修改 / 0 图文生图 / 任意题材)。设计师如果是"复刻爆款 + 出 N 张系列广告图"走 A;如果是"通用修图 / PS 一下 / 纯文字生一张"走 B。
+  触发词:复刻这张爆款图给我们游戏 / 做几张游戏广告图 / 学这张图做几张类似的 / 游戏海报生成 / 买量素材 / 任意题材的游戏广告图复刻 / 出 N 张系列广告图。
+---
+
+# game-ad-imagegen — 游戏买量图生成 Skill
+
+## 这个 skill 在干什么
+
+**复刻"网页 ChatGPT 出爆款游戏广告图"的工作流**——用户给爆款参考图 + 自家实机图 + 一段中文 prompt，agent 模拟网页 GPT-5.x 的 6 步操作（理解 → 拆解 → 选角色 → rewrite → 调 image_gen → 归档），输出 N 张高质量游戏广告图。
+
+质量目标：
+- ✅ 出图质量复刻 ChatGPT 网页版水平（image_gen 一次性把所有中文 text 画在图里）
+- ❌ 不走"image_gen 留白 + 后期 Pillow 叠字"路线（字体单薄、不融合，反模式）
+- ❌ 不走"无 rewriting / 100% 复制原图"路线（失败模式）
+
+## 触发条件
+
+LLM agent 检测到下列条件命中时启动 skill：
+
+1. 用户输入中包含 **≥1 张参考图**（任意张数 / 任意题材 / 任意角色；图的用途由 Step 1 vision 实际看到的内容决定，**不预设"必须是 1 风格图 + 1 角色图"二分**）
+2. 用户 prompt 中含"广告图 / 海报 / 买量素材 / 复刻 / 学这张图 / 做 N 张类似的 / 改文案 / 把图1改成 X" 或同义 / 类似词
+3. 输出张数 N ≥ 1（"做 1 张" / "做 5 张" 都支持）
+
+**支持的形态**（28 raw case 验证）：1 张图改文案 / 2 张爆款风格融合 / 3 张含 UI+文字+角色头像迁移 / 5+ 张实机图自由组合 — 都走 A skill；图的角色（参考 / 素材 / 叠加目标）由用户 prompt 描述 + vision 实际识别决定。
+
+**不命中场景**：**0 张图的纯文字生图**（text2im）→ 让 B skill `codex-imagegen-fork` 接管（B 的 `generate` 子命令支持 text2im，A 走 `/v1/images/edits` 必须 ≥1 图）。
+
+## 必读约束（QUALITY INVARIANTS）
+
+`scripts/_config.py` 里的 `QUALITY_INVARIANTS` 会自动注入到每次 image_gen 调用，但 agent 在 Step 4 装配 prompt 时也要遵守。这些约束**与图片张数 / 形态无关**：
+
+| 约束 | 含义 | 失败案例 |
+|---|---|---|
+| ✅ 每张参考图的角色由 vision 实际看到的内容判断 | 不预设"图1=风格 / 图2+=角色源"二分。每张图当什么用(style 锚 / 角色源 / UI 模板 / 文案模板 / 改文案目标)由 vision 实际看到的内容 + 用户 prompt 上下文决定 | 凭文件路径名 / 序号 / 训练先验假设图用途 → hallucinated prompt(已知失败模式) |
+| ✅ image_gen 一次性画 readable Chinese text | 标题/CTA/气泡/副文案全在 image_gen 里完成 | 留白后期 Pillow 叠字 → 字体单薄、不融合 |
+| ❌ 不允许 Pillow 后期叠字 | 不要写 `Text (verbatim): none. Leave blank.` 这种留白指令 | 留白叠字反模式 |
+| ✅ ~70% 锚定参考图实际看到的内容，~30% 创作变化 | 风格 / 构图 / 角色形象基于 vision 实际看到的参考图内容 | 100% 复制参考图 = 失败；过度发挥脱离参考图 = 失败 |
+| ✅ 角色/资产从用户实际提供的图里选 | 不能凭空发明用户没给的角色 | 凭训练先验幻觉一个用户没给的角色 = 失败 |
+
+> ⚠️ **历史 case_15 形态偏见 fixed**：`_config.py.QUALITY_INVARIANTS` 文本之前含 "first image = Image A (style anchor)" 等 case_15 二分假设，对 case_09 (5 实机)/case_24 (2 爆款) 等其他形态有害。Batch UX 段用 `--no-invariants` 绕开了这个偏见；主流程 Step 1-4 在 2026-05-13 一并改 generic，由 vision 决定每张图用途，不预设。
+
+## 6 步操作流程
+
+> ⚠️ **不要从外部翻历史模板或角色 lookup 取字段**。所有角色与构图字段一律由 Step 1 的 vision call 从用户当次输入图抓取。
+
+---
+
+### Step 1: 输入材料理解（必须真的看图，不假设 / 不凭文件名猜）
+
+🚨 **强制 vision verification（防 hallucinated prompt）**
+
+1. **真的看图**——必须用你（agent）的 multimodal vision 能力 / `view_image` tool / image read tool **实际加载每张参考图的 bytes** 到 conversation context。**不能**凭文件路径名（如 `ref_image_a.png` / `game_image_b.png`）、case_id、用户原 prompt 里的题材词来"猜"图内容。
+2. **Verify see（强制输出）**——在写 StyleAnchor / CandidatePool 之前，**先用 1-2 句中文 plain description 列出每张图你实际看到的内容**（"图1：[实际看到的视觉描述，含题材/构图/UI/配色/角色性别外貌等可观察元素]"），让 user 能 verify 你是真看到了图，**不是凭训练先验幻觉**。如果你写不出具体的视觉细节（只写空泛的"a dramatic game-poster" / "a fantasy warrior" 这种没有 verify 价值），说明你没真读到图。
+3. **没 vision 能力的 model 不能跑此 skill**——如果你是纯文本模型（无 multimodal），**必须主动 stop**，告诉 user："我没有 vision 能力，请换有视觉的 model（Claude / GPT-4o+ / GLM-5V / Hy3 等）跑此 skill，或你自己描述每张图给我"。**不要硬撑**写 hallucinated prompt。
+4. **为什么强制**——历史失败模式:agent 跳过 vision call,凭训练先验幻觉一个跟实际参考图毫无关系的 prompt(题材完全错位、角色完全错位)。**根因 = Step 1 之前是 implicit vision 假设**;现在强制 explicit verify 把这条堵死。
+
+读完图 + 写完 verify 描述之后，再提取以下结构化字段。**每张图的角色由 vision 实际看到的内容 + 用户 prompt 上下文判断，不预设位置 ↔ 角色映射**——单张图可以同时承担多个角色（如同时作 style anchor + 改文案目标），多张图可以共同贡献某个角色（如 3 张实机图都是角色源）。
+
+- **每张参考图**：vision 实际看到的内容 → 判断用途（style/构图 anchor / 角色源 / UI 模板 / 改文案目标 / 文本资产 / 等）
+- **用户 prompt**：解析需求（明示的图分工 / 角色名 / 标题 / CTA / 张数 / 尺寸）
+
+输出（在 agent 思考过程中保留，字段名固定，内容由 vision 实测填）：
+```
+PerImageNotes: [
+  { idx: 1, path: "<filename>", role: <vision+prompt 判断的用途，可多重，如 "style+构图 anchor, 含中文标题文本">,
+    key_visuals: <实际看到的关键视觉元素：题材 / 构图 / 主体 / 配色 / 标志特征>,
+    chinese_text_in_image: <列出图里能读到的中文，或写 "无"> },
+  { idx: 2, path: "...", role: ..., key_visuals: ..., chinese_text_in_image: ... },
+  ...
+]
+StyleSummary:  { 构图 anchor 来源: <哪张图 idx 或多张融合>,
+                 主导配色: <vision 实际看到>,
+                 字效: <vision 实际看到>,
+                 UI 元素: <vision 实际看到>,
+                 整体氛围: <vision 实际看到的风格类型,描述形容词组合,不预设题材库> }
+CandidatePool: [{ id: "subj_1", source_idx: <来自哪张图>, visual_name: <服装色 / 武器 / 五官 / 性别 / 标志特征> },
+                { id: "subj_2", source_idx: ..., visual_name: <...> }, ...]
+UserIntent:    { 输出张数: N,
+                 主CTA: <用户原话>,
+                 题材: <如用户原话明确指定，照贴；没指定则写"由 vision 推断"，照 PerImageNotes 实际看到的题材填>,
+                 自由创作度: <默认 30%>,
+                 画幅: <默认 1536x1024 / 用户指定按指定> }
+```
+
+⚠️ **题材字段只在用户原话明确指定**（如"我们的 X 游戏"）时填，否则永远写"由 vision 推断"。不要根据任何参考图的角色形象**猜测**题材然后套预设模板。
+
+---
+
+### Step 2: 需求拆解（agent 自己干）
+
+把用户 prompt 拆成可执行约束清单：
+- 输出数量 N（用户 prompt 里说几张就几张；没说默认 1）
+- 画幅 + 比例（**默认 `1536x1024`** ≈ 16:9，gpt-image-2 合法 landscape；用户要其他尺寸如 1920x1080 / 9:16 / 650x250 时映射到最接近的合法 size：1024x1024 / 1536x1024 / 1024x1536 / auto）
+- 风格描述（来自 Step 1 StyleSummary，**全部由 vision 抓取**）
+- 版式（来自 Step 1 StyleSummary 视觉描述——参考图实际看到啥版式就跟啥版式：单角色海报就单角色 / 漫画分镜就分镜 / 面板就面板 / 风格融合就融合，**不套固定模板**）
+- 主文案（用户 prompt 里指定的 CTA 文字 + Step 1 PerImageNotes.chinese_text_in_image 抓到的原图中文）
+- 副文案策略（贴合每个角色身份，**身份从 Step 1 CandidatePool 实际识别到的视觉特征取**）
+- 自由创作度（默认 30%）
+
+---
+
+### Step 3: 角色/资产选择（agent 决定）
+
+**情况 A**：用户 prompt 明确指定 N 个具体名字 → 用指定的（agent 从 Step 1 CandidatePool 找视觉匹配，或按 CandidatePool 视觉特征自由发挥）
+
+**情况 B**：用户 prompt 含糊（如"从图2/3 选适当角色做 5 张类似的"）→ agent 从 CandidatePool 自由选 N 个：
+- **唯一选规则**：视觉差异化（N 个角色彼此看着不同）+ CandidatePool 实际识别到的元素 + 跟参考图整体题材气质合理
+- ⚠️ **绝对不要套预设题材偏好** — 不管参考图看着像什么题材，永远从 CandidatePool 实际识别到的角色里选，不要写"如果是 X 题材默认选 Y 角色"这种规则
+
+**情况 C**：CandidatePool 为空或不足 N 个 → 暂停问用户"实机图里只识别到 X 个候选，你要这 X 个还是补图？"
+
+---
+
+### Step 4: Prompt rewriting（核心，agent 自己写英文 prompt）
+
+把用户的中文需求 + Step 1-3 输出，**改写成 N 段详细英文 prompt**，每段对应 1 张图（1 个角色）。
+
+⚠️ **不要外部模板套**：所有字段（角色视觉、StyleSummary、构图）只从 Step 1 vision call 当次抓取的内容填，不要从外部翻历史模板或角色 lookup。
+
+**每段 prompt 必须包含**（字段口语化，不强制 schema 结构）：
+1. 整体格式声明：`Create a polished horizontal game-promo poster in 1536x1024, aspect ratio 16:9.`（或用户指定的尺寸映射到合法 size）
+2. **每张图独立 labeling**——按 Step 1 PerImageNotes 写:`Image 1 (<role from PerImageNotes>): <key_visuals 实际看到的视觉摘要>. Image 2 (<role>): <...>. ...` 每张图独立角色,**不要 collapse 成"Image A primary style / Image B/C source"二分**(那是固定形态偏见,对单图修改 / 多实机图组合 / 风格融合 等其他形态有害)。
+   - 通用示例(填 Step 1 实际识别出的内容):`Image 1 (<vision 判断的 role,如 style+构图 anchor>): <vision 实际看到的视觉关键词>. Image 2 (<vision 判断的 role,如 角色源>): <vision 实际看到的视觉关键词>.`
+3. 角色定位:`Use the hero/subject visually identified in Image <N> as the main figure` —— **基于 Step 1 PerImageNotes + CandidatePool 实际识别的内容**,不凭训练先验幻觉用户没给的角色。
+4. 角色视觉:从 Step 1 CandidatePool 视觉描述照贴(**不从外部 lookup 取**)。
+5. 构图细节:从 Step 1 StyleSummary 视觉描述照贴(**不套固定"comic inset / speech bubble / bottom CTA"模板**——如果参考图是别的版式就跟着参考图)。
+6. 标题 + 气泡 + 副文案 + CTA(**all readable 中文 text rendered in image, NOT blank for later overlay**)。如果参考图已含中文文字(PerImageNotes.chinese_text_in_image 非空),prompt 里**显式 verbatim quoted 列出**原文字(例:`Title bar (verbatim): "<vision 看到的原标题>"`),不写英文描述("the calligraphy title" 这种是错的,模型会留空白)。
+7. 风格质量:从 Step 1 StyleSummary.整体氛围 选——基于 vision 实际看到的视觉风格词写英文描述(如 `polished 2D illustration` / `semi-realistic painterly CG` / `stylized concept art` 之类英文风格语,**vision 看到什么就写什么,不从题材 lookup 取**)。
+8. 约束:`No phone UI / FPS overlay / vConsole / watermark / app-store badges / blank text containers`。**绝对不写** `do NOT render readable words` 这种反向指令(已知失败模式:agent 没读到图时,保守写"不渲染文字",让所有标题位置变成空白框)。
+
+**绝对禁止**：
+- 在 prompt 里写 `Text (verbatim): none. Leave blank.` 或 `no Chinese characters` → 留白叠字反模式
+- 写任何题材 hardcoded lookup → 失普适性
+- 把 Step 1 vision 没看到的元素塞进 prompt → 凭空发明
+- 堆 multi-panel 多场景 / 多 hero / 8+ text 位置（**会稀释 image model 的 text 渲染精度**，2026-05-12 case_24 实证）
+
+---
+
+### Step 4 范本：T9 风格 prompt（2026-05-12 强约束）
+
+**关键约束**(基于 case_24 / case_09 / case_04 跨场景验证 — recipe 文档在开发者本地工作区,设计师不需要):
+
+1. **单 hero focus**：1 个主体角色 + ≤2 个副角（inset 头像 / sidekick / 小兵反应）。**不要堆 multi-panel 多场景**。
+2. **4-7 个显式 Chinese text 位置**（标题 + 主 CTA + speech bubble + small caption + tag/stamp 等）。少于 3 个空虚，**多于 7 个稀释 image model text 精度**。
+3. **每个中文 text 字面 quoted 列出**：写 `Large stylized title at top: "<游戏标题>"`（用实际中文字面，不是 `"the calligraphy title"` 这种英文描述）。
+4. **70% faithful 30% creative 显式写**：在 prompt 末尾加 `Keep about 70% faithful to reference style, 30% creative variation`。
+5. **bullet list 组织 main content**（不用 13 字段 schema）：
+   ```
+   Main content requirements:
+   - {Central hero: 视觉描述 + pose}
+   - {Background: atmosphere + key props}
+   - Large stylized title at top in {style}: "{TITLE}".
+   - Main promotional banner: "{MAIN_TEXT}".
+   - {Optional speech bubble}: "{BUBBLE_TEXT}".
+   - {Optional small inset/stamp}: "{SIDE_TEXT}".
+   ```
+6. **强约束** 必须加在 Quality and style requirements 段：
+   - `All Chinese text rendered crisply and readably DIRECTLY in the image`
+   - `Do NOT leave any text container blank`
+   - `Do NOT use placeholder pseudo-Chinese`
+   - `Do NOT use English subtitles` （防 GLM 等纯英文模型偏题）
+
+**结构骨架**（distilled from 2229 字符英文工程化结构，跨场景验证 0 错字；不需要查外部模板）：
+```
+Create a polished {orientation} {asset type} in {WxH}, aspect ratio {ratio}.
+Image 1 (<role: e.g. "style+构图 anchor" / "角色源" / "UI 模板" / "改文案目标">): {describe what Image 1 actually shows — from Step 1 PerImageNotes.key_visuals}.
+Image 2 (<role>): {describe what Image 2 actually shows}.
+{... add one line per reference image, each with its role from PerImageNotes ...}
+
+Design a brand-new composition echoing the style anchor image's visual language while
+adapting to {orientation/ratio}. Keep about 70% faithful, 30% creative.
+
+Main content requirements:
+- {bullet list of 4-7 items, each with explicit "中文 text" if applicable}
+
+Quality and style requirements:
+- {No raw screenshot artifacts / phone UI / FPS / watermarks}
+- {Polished commercial finish, specific style notes}
+- {Orientation} composition only, {WxH}.
+- All Chinese text rendered crisply and readably DIRECTLY in the image.
+```
+
+**为什么这套约束**：image_gen.py 已切到 `/v1/images/edits` 端点（recipe 版 2026-05-12），**prompt 字面就是 image model 收到的，没有 L2 rewriter 二次改写或简化**。所以 verbatim 中文准确度直接靠 agent 写 prompt 的字面精度，scene complexity 也直接决定 image model 处理 budget 分配。
+
+---
+
+### Step 5: 图像生成（调 skill 提供的工具）
+
+**第 1 次调用**：
+```bash
+python scripts/image_gen.py \
+  --prompt-file <step4 第 1 段 prompt 写到的临时文件> \
+  --refs <用户的参考图,实机图1,实机图2,...> \
+  --out <临时输出目录>/01.png \
+  --meta-out <临时输出目录>/01_meta.json
+```
+
+第 1 张作风格基准。完成后检查：
+- HTTP 200 + meta_json 落盘 + PNG 文件大小 > 0
+- ~~meta_json.revised_prompt 非 None~~ → **过时**: `/v1/images/edits` 端点不返回 `revised_prompt`(该字段是 `/v1/responses + image_gen tool` 路径独有)。recipe 切到 edits 端点后这个检查不再适用,**改成检查 `http_status == 200 + 文件大小 > 0`**
+- PNG 含 readable Chinese text(不是空白)
+
+**多图（N ≥ 2）调用** — 两条路径，按场景选：
+
+**(推荐) 走 Batch UX 段** — HTML 表单触发 + 本 skill 内 `scripts/batch_runner.py`,见本文档后面 "Batch UX (HTML 表单触发模式)" 段。设计师推广路径走这条,agent 也可以直接调(agent 写好 config.json → 调 `python ~/.claude/skills/game-ad-imagegen/scripts/batch_runner.py <config.json>`,runner 调本 skill 的 image_gen.py,多 task / 不同 prompt / 多 n)。
+
+**(简单循环) agent 自己跑 N 次** — 把 Step 4 写的 N 段 prompt 各自写到临时文件，循环调 `python scripts/image_gen.py --prompt-file ... --refs <所有用户参考图都传> --out <i>.png` N 次。每次传**所有用户参考图**，让 image model 根据 prompt + 参考图上下文自己保系列一致性。简单直接，不需要 anchor strategy。
+
+> Phase 1 历史接口 `image_gen_batch.py --config batch.json`（含 `anchor_strategy="first"` 跨调用串图）已保留在 `scripts/` 供历史 case 兼容，但**新推广不用**——它假设"第 1 张当 anchor 喂给后续调用"是 case_04 形态偏见（5 张系列广告场景），对 case_05 (1 张改文案) / case_24 (2 张风格融合) 等其他形态没有意义。推广路径走 Batch UX 或简单循环。
+
+---
+
+### Step 6: 输出归档（调 save_outputs.py）
+
+```bash
+python scripts/save_outputs.py \
+  --batch-meta <临时输出目录>/_batch_meta.json \
+  --out-dir <最终交付目录>/<case_id>/
+```
+
+⚠️ 归档目录命名**不要**加题材 / 日期 / 角色名后缀（如 `<日期>_<题材>_<角色名>等/`），保持纯 `<case_id>/` 简洁。
+
+输出：
+- `01.png`, `02.png`, ..., `0N.png`：N 张交付图
+- `meta.json`：包括 saved_files / revised_prompts / config（作 audit）
+- `contact_sheet.png`：N 张拼图预览
+
+最终把 `<最终交付目录>` 路径告诉用户，附上 contact_sheet.png 的预览。
+
+---
+
+## Batch UX (HTML 表单触发模式)
+
+本 skill **自包含**一套批量 HTML 表单 + runner,供设计师跑多任务时用。**本表单专属本 skill,生成的 config.json 写死 `skill: "a"`,runner 也只跑本 skill。** 如果用户想用 B skill 走另一条独立路径,B 有自己的 `web/batch_form.html` + `scripts/batch_runner.py`,本 skill 不知道也不关心 B 的实现。
+
+**这条路径绕开 Step 1-4 的 vision/rewriting**(用户已在表单里手填中文 prompt + 直接给图路径),agent 只做执行器。
+
+**关键文件位置**(都在本 skill 内,跟 SKILL.md 同根):
+
+| 文件 | 用途 | 装机后绝对路径 |
+|---|---|---|
+| `web/batch_form.html` | 表单 UI(skill='a' 写死) | `~/.claude/skills/game-ad-imagegen/web/batch_form.html` |
+| `web/batch_form.js` | 表单逻辑 | `~/.claude/skills/game-ad-imagegen/web/batch_form.js` |
+| `web/style.css` | 表单 + grid 样式 | `~/.claude/skills/game-ad-imagegen/web/style.css` |
+| `web/grid_template.html` | 结果 grid 模板 | `~/.claude/skills/game-ad-imagegen/web/grid_template.html` |
+| `scripts/batch_runner.py` | runner 主程序(只跑 skill='a') | `~/.claude/skills/game-ad-imagegen/scripts/batch_runner.py` |
+| `scripts/launch_detached.py` | **进程脱离 launcher**(必走) | `~/.claude/skills/game-ad-imagegen/scripts/launch_detached.py` |
+| `scripts/render_result_grid.py` | grid HTML 生成 | `~/.claude/skills/game-ad-imagegen/scripts/render_result_grid.py` |
+
+runner 内用 `Path(__file__).resolve().parent` anchor 自动定位本 skill 的 `image_gen.py`(sibling),**不跨 skill 查 B**。
+
+### 入口 — agent 自动开 form(零负担,**任何想用本 skill 出图的请求**都唤起)
+
+#### 何时唤起 form
+
+**user 在对话区说以下任意一种,agent 都唤起 form**(不管 n=1 单图还是 n=N 批量):
+
+| 用户话术(中文/英文,意图任意一种) | agent 行为 |
+|---|---|
+| "我要生图" / "做一张图" / "做几张图" / "出图" | 唤起 form |
+| "做一张游戏广告图" / "做几张广告图" / "复刻这张爆款" / "学这张图做几张" | 唤起 form |
+| "我要批量出图" / "打开批量表单" / "开始跑批" | 唤起 form |
+| "用 A skill 出图" / "用 game-ad-imagegen 跑" | 唤起 form |
+| "做张游戏海报" / "出 N 张系列广告" | 唤起 form |
+
+> form 顶部 n 字段默认 = 1(单图模式),user 想批量改 n 即可。**form 既是单图也是批量入口,没有"批量专用 form"。**
+
+**agent 不要让 user 自己开 terminal / 自己点 URL**。直接按下面 2 步走:
+
+> 🚨 **绝对不要二次确认 — 看到触发词直接执行,不要问"用 A skill 表单可以吗"/"默认浏览器打开可以吗"/"我先帮你做 X,确认一下"。**
+> SKILL.md 是**指令**不是**建议**,user 已经说了"我要做图"就是授权。多问一句 = UX 噪音,设计师会嫌烦。
+> ❌ 错误示例:`我给你开表单跑批。你确认以下两点:1. 用 A skill 表单 2. 默认浏览器打开。回我一句:开`
+> ✅ 正确示例:(静默 Bash 跑 http.server + webbrowser.open)→ 对话区报 `✅ 已打开 A skill 出图表单 → http://localhost:8765/web/batch_form.html`
+
+#### 步骤 1:起 http server + 调系统默认浏览器(默认路径)
+
+```bash
+# 1.0 后台起 http server(跨 OS 通用,Python 自带)。用 Bash run_in_background=true。
+#     如果 8765 已被占用(server 已经在跑) → OSError errno 10048 / Address in use → 直接跳 1.1 (reuse)
+python -m http.server 8765 --directory ~/.claude/skills/game-ad-imagegen
+
+# 1.1 用 Python webbrowser 调系统默认浏览器(Chrome / Edge / Firefox / Safari),跨 Windows/macOS/Linux 通用
+python -c "import webbrowser; webbrowser.open('http://localhost:8765/web/batch_form.html')"
+```
+
+> ⚠️ **不要尝试 WorkBuddy 自带 preview**:已知 bug(复制粘贴失效 / "生成跑批指令" 按钮 click 不响应),用了反而卡。
+> ⚠️ **不要先尝试 host preview tool**:WorkBuddy preview 不可信,Claude Code 的 preview 没 bug 但需要特定环境配置 — **直接走系统浏览器最稳**。
+
+**步骤 1.1 失败时的 fallback**:host 无 GUI 环境(SSH / Docker / 远端 server)/ Python webbrowser 不可用 / 没系统默认浏览器 → **直接在对话区发 markdown 可点链接** `[http://localhost:8765/web/batch_form.html](http://localhost:8765/web/batch_form.html)` 让 user 自己点。
+
+#### 步骤 2:对话区通知 user + 等触发
+
+agent 发一条简短消息(根据用哪个 tier 微调措辞):
+
+> ✅ 已打开 A skill 出图表单(在 preview 面板 / 浏览器中)→ http://localhost:8765/web/batch_form.html
+> 配好后,回这里说 **「跑 batch_<时间戳>」** 或把 `config.json` 整段粘到对话区。
+> 单图就把 n 填 1(默认),批量就改大。
+
+**然后等 user**。不要主动 ping / 不要重复发消息。
+
+#### 触发模式
+
+| 用户在对话区说 / 做 | agent 行为 |
+|---|---|
+| 说 `跑 batch_<id>` / `run batch_<id>` / `跑 <绝对路径>/config.json` | **触发 A**(下方) |
+| 拖入 config.json 文件,或粘贴一段含 `"batch_id":` 的 JSON 代码块 | **触发 B**(下方) |
+
+### 触发 A — 用户给 batch_id
+
+1. config 路径:**首选**用户给的绝对路径(粘贴 JSON 时 agent 用 Write 工具落盘到 `~/Downloads/<batch_id>.json`,或者用户拖入的文件路径直接用);找不到 → 问用户「请把 JSON 粘到对话区,或把 config.json 拖进来」。
+2. **检查 `config.skill == "a"`**;如果不是,runner 自己会 reject 并提示用户走 B 的 runner,**本段不处理也不主动跨调度**。
+3. **关键 — 跑批前立即唤起 result_grid 进度页给 user**:
+   - runner 一启动就会在 `<out_dir>/result_grid.html` 写一个 "running" 状态的进度页(空 grid,每 5s auto-refresh)
+   - agent **不要等批跑完才开**,而是先用 launch_detached 起 runner(<1s 返回),然后**马上**唤起 `<out_dir>/result_grid.html` 给 user 看(用户每 5s 自动刷新,看到一张张图依次出现 + 进度条 + 状态 badge,**不用追问 agent "跑到哪了"**)
+   - **默认**: `python -c "import webbrowser; webbrowser.open(r'<out_dir>/result_grid.html')"` 调系统默认浏览器
+   - fallback: 对话区发可点路径让 user 自己点
+   - ⚠️ 不要尝试 WorkBuddy 自带 preview(有 bug)
+4. **跑 runner — 必须走 launch_detached.py(不要直接调 batch_runner.py)**:
+
+   ```bash
+   python ~/.claude/skills/game-ad-imagegen/scripts/launch_detached.py \
+          ~/.claude/skills/game-ad-imagegen/scripts/batch_runner.py \
+          <config_path>
+   ```
+
+   - launcher **foreground 跑、<1s 返回**,stdout 输出 `detached_pid=X` + `method=DETACHED+BREAKAWAY` + `log=Y`。agent 把 PID 记下来,可选 print 给 user。
+   - **为什么必须 detach**:WorkBuddy(以及任何 Job Object-based host)在 ~2 min 后会杀 agent 的子进程,直接调 batch_runner 会出 1-2 张就停。detach 让 batch_runner 完全脱离宿主进程树,可以跑满整个 batch(2026-05-14 v1/v2 实测验证:无 detach 110s 被杀 / 有 detach 跑满 25 min)。
+   - **不要用 `run_in_background=true`** — launcher 已经 detach,Bash 用 foreground 调即可(launcher 自己秒退)。
+   - **agent 不需要 BashOutput 监控** — batch_runner 的 stdout/stderr 全进 `<out_dir>/<config_basename>_detached_launcher.log`,user 看的是 result_grid 自动刷新。
+5. **跑完判定** — 由 user 自己看 result_grid 的 status badge(🟦 running → 🟩 done / 🟥 error)。agent **不需要主动 poll**;如果 user 后续问"跑完了吗"再做一次 `tail _batch_meta.json` 拿 status 字段答。**预计时间** = Σ(每任务 n) × 单图耗时(low=15-30s / medium=45-90s / high=90-180s)。
+
+### 触发 B — 用户粘贴 JSON 或拖文件
+
+1. 解析 JSON 拿到 `batch_id`。如果是粘贴的 JSON:用 Write 工具落到 `~/Downloads/<batch_id>.json`(浏览器下载默认路径,user 友好)。如果是拖入的文件:直接用文件路径。
+2. 之后等同触发 A 步骤 2-6。
+
+### config.json schema
+
+见本 skill 内 `scripts/batch_runner.py` 顶部 docstring。简要:
+```json
+{
+  "batch_id": "...",
+  "skill": "a",               // 必须 "a"(本 skill runner 只接 'a')
+  "out_dir": "...",
+  "size": "1536x1024",        // batch 默认尺寸 (1024x1024 / 1536x1024 / 1024x1536 / auto)
+  "quality": "medium",        // batch 默认质量 (low / medium / high)
+  "tasks": [
+    {
+      "task_id": "t01",
+      "reference_images": [".../1.png", ".../2.png", ".../3.png"],  // ≥1 张;顺序 = 用户 prompt 里"图1/图2/图3"
+      "prompt": "...",        // 中文 prompt,终稿;角色分工(谁是参考/素材/叠加)全在 prompt 里
+      "n": 1,                 // 同 prompt 跑几张
+      "size": "1024x1536",    // 可选,覆盖 batch 默认
+      "quality": "high"       // 可选,覆盖 batch 默认
+    }
+  ]
+}
+```
+
+### CLI 调用形态(batch_runner 自动构造,不用 agent 手写)
+
+`python image_gen.py --prompt-file X --refs a.png,b.png --out C --meta-out M --size S --quality Q --no-invariants`
+
+`--no-invariants` = batch UX 终稿模式,不注入 `_config.py.QUALITY_INVARIANTS` 文本块(即使 invariants 现已 generic 化,batch UX 仍坚持"用户在表单里写的就是终稿,runtime 不加任何额外 system text"原则)。
+
+### 支持的形态（28 raw case 验证矩阵覆盖）
+
+batch UX **不预设图片角色**——`reference_images` 就是一个有序列表，每张图的用途由用户的 prompt 自己描述。下表只列典型场景做参考，**不是 schema 约束**：
+
+| 实际形态 | 例 | 用户 prompt 里通常怎么写 |
+|---|---|---|
+| 1 张图 | case_05 | "把文案 X 改成 Y" — 单图修改 |
+| 2 张图（都是爆款） | case_24 | "根据这两张趣味图，生成乐不思蜀的趣味图" — 风格融合 |
+| 3 张图（爆款+实机） | case_15 | "将图1的UI和文字加到图2上，图3角色作头像" — 显式指定每张用途 |
+| 5+ 张图（全实机） | case_09 / case_10 / case_19 | "这是游戏截图，选元素做宣传图" — 让模型自由组合 |
+
+### A skill 不支持（明确 reject）
+
+- **0 张图（纯文字生图 text2im）**：A 走 `/v1/images/edits`，至少要 1 张图。case_20 这种"生成第一人称视角的古代战场..."的纯描述请求 batch_runner 会校验失败 + 提示用户切换到 B skill（B 的 `generate` 子命令支持 text2im）
+
+### Batch UX 模式下要明确**不做**的事
+
+- ❌ **不要** vision 重读图 / 重写 prompt：用户填的是什么就跑什么。表单里的 prompt 即终稿。
+- ❌ **不要** 给 image_gen 注入 QUALITY_INVARIANTS（batch_runner 已 `--no-invariants`）— batch UX 终稿模式认为用户在表单里写的就是终稿，runtime 不加任何额外 system text，让模型只看用户 prompt 原样跑。
+- ❌ **不要** 自动给 prompt 拼 anchor_strategy 串图：`n > 1` 时 agent 顺序跑 n 次独立调用，保持多样性。
+- ❌ **不要** Pillow 后期叠字：image_gen 一次性出图。
+- ❌ **不要** 主动给 prompt 加修饰词或英文化：表单 JSON 里的中文 prompt 原样传入。
+- ❌ **不要** 改 reference_images 顺序：顺序对应 prompt 里"图1/图2/图3"，用户自己排的就照跑，不要因为"觉得 X 张应该当 anchor"擅自重排。
+
+### 失败时的 fallback
+
+- 步骤 1 3 tier 全部失败 → 对话区直接发 markdown 可点 URL 让 user 自己点:`[http://localhost:8765/web/batch_form.html](http://localhost:8765/web/batch_form.html)`
+- batch_runner.py 校验失败（参考图不存在 / 0 张图 / prompt 空）→ 把 `! 校验失败` 清单贴给用户，让他回表单改，**不要**自己猜路径或自己补 prompt
+- launcher 输出 method=`DETACHED_NO_BREAKAWAY` 而不是 `DETACHED+BREAKAWAY` → 父 Job 不允许 breakaway,**fallback 已生效**(仍 detach,只是没逃出 Job),通常也能活,但如果 batch 跑到中途被杀 → 这是 host 仍在杀,需要更暴力手段(scheduled task / WMI),回报给开发者
+- batch 跑到中途停 + result_grid badge 卡在 🟦 几分钟没变 → tail `<out_dir>/<config>_detached_launcher.log` 看 batch_runner 是不是 crash 了。如果 log 末尾是 traceback,把 traceback 贴出来调
+- config.json 解析失败 → 把原始 JSON 错误位置告诉用户，让他回表单页重生成
+
+## 图片迭代修改（基于已生成图再加工）
+
+设计师跑完一批后看 `result_grid.html`,想"第 3 张头改一下 / 第 5 张文字改一下 / 这张作为新参考再做 2 张变体"——技术基础已 free,**`gpt-image-2 /v1/images/edits` 端点天然支持把任意已生成 PNG 当下次 input**(把它写到 task 的 `reference_images` 列表就行,不区分"原图"还是"AI 生成图")。
+
+三种典型迭代场景:
+
+**场景 1 — 单张图局部修改**(改头 / 改文字 / 改气泡)
+- 用户在 result_grid 里点开第 3 张,拿到路径 `<out_dir>/t03_01.png`
+- 用户回表单建新 batch,task 的 `reference_images = ["<out_dir>/t03_01.png", "<新角色参考图>"]`, `prompt = "把这张图的主角头部换成图2里识别出的角色形象,其他保持"`
+- batch_runner 把 ref_images 全发给 `/v1/images/edits`,image_gen 自己识别"主图 + 参考图"语义
+
+**场景 2 — 用已生成图当风格 anchor 再做 N 张系列**
+- 用户拿满意的第 5 张当 series anchor: `reference_images = ["<out_dir>/t05_01.png"]`, `prompt = "保持这张图的画风/配色/版式,改成另一个角色 X 的版本",n = 3`
+- 多张图共享 anchor,系列一致性强
+
+**场景 3 — fork 同一 task 跑多版本**
+- 用户对第 1 张的 90% 满意但 prompt 想微调:复用 t01 的 `reference_images`,但 prompt 改新版本,再跑一遍
+
+**当前 UX 限制**(2026-05-13):
+- 用户**手贴路径**:从 result_grid 复制 `t03_01.png` 的绝对路径 → 粘到 form 的 `reference_images` 输入框。能 work,但繁琐。
+- 没有"加载已有 batch 复用 tasks"按钮:想改第 3 张只能从头建 batch,改不动旧的。
+
+**未来可升级**(按工程量 P0→P2,需用户决策):
+1. **(P0,~30 min)** form 加"加载已有 batch"按钮:输入或选择 `<out_dir>/_batch_meta.json` → JS 反向 populate tasks 到表单 → 用户改完再下载新 config(新 batch_id)。无后端,纯 JS。
+2. **(P1,~2h)** result_grid 缩略图旁加"复用这张当参考图"按钮:点击 → 把图路径 + 模板 prompt 写到 localStorage / URL hash → form 自动 populate 新 task。
+3. **(P2,~半天)** 起 Flask 后端服务,form 直接 POST → runner → push 实时 stdout 到浏览器。最丝滑但工程量大。
+
+设计师推广**起步阶段建议先用现状**(场景 1-3 都能通过"手贴路径"完成),等真实跑 case 后再决定升级哪条 UX。
+
+## 失败模式 / 异常处理
+
+| 现象 | 诊断 | 处理 |
+|---|---|---|
+| image_gen HTTP 4xx/5xx | API key 无效 / 配额耗尽 / 参考图过大 | 检查 EPHONE_API_KEY；缩小参考图 |
+| ~~revised_prompt = None~~ | **不是失败模式** — recipe 切 `/v1/images/edits` 端点后此字段恒为 null,这是正常的(该字段是 responses+tool 路径独有,edits 端点不返回)。文档 2026-05-13 已修正 | 不用处理 |
+| 图片字体单薄 / 错位 | 走错路线了，不要做 Pillow 后期叠字！ | 检查 Step 4 prompt 里是否误加了"留白"指令；image_gen 必须一次性画字 |
+| 输出图过度像参考图（人物特征 ≈ 参考图人物变体） | 参考图过度复刻：prompt 不够具体 | 强化 Step 4 的"角色身份从 Step 1 PerImageNotes 实际看到的图源取"约束 |
+| N 张序列视觉风格不一致 | 没把所有参考图都传给每次调用 | 简单循环模式：每次 `--refs <所有用户参考图>` 全传；走 Phase 1 老接口的话 `anchor_strategy="first"` |
+| 角色漂移（生成的角色跟实际图源不像） | rewriting 时没把实际角色视觉描述堆进 prompt | Step 4 加 `based on Image <N> visual identity: <服装色> <武器> <表情>` —— `<N>` 是 PerImageNotes 里识别为角色源的图编号 |
+| 选角色总是同一批（如总是同样 5 个名字）| ⚠ **触发了预设偏见 bug** | 检查 Step 1 CandidatePool 是否真的从 vision 抓取，**不是从记忆 / 训练先验 lookup**。绝对不要从外部翻历史角色表照抄 |
+
+## 配置准备（首次使用）
+
+### Agent 行为：First-time setup（零负担推广路径）
+
+如果 `scripts/image_gen.py` 报错 `RuntimeError: 缺 API key`，agent **必须**按以下流程处理（不要假设用户懂环境变量 / 不要让用户去翻系统设置）：
+
+1. **问用户一次**(用用户的母语，对设计师友好措辞):
+   > "我需要你的 ephone API key 才能跑这个 skill。请把 key 贴在对话里(以 `sk-` 开头)，我会帮你保存到本机配置文件 `~/.config/game-ad-imagegen/config.toml`，以后自动用，不用再问。"
+2. **等用户回复**。如果用户贴的不像 key(没 `sk-` 前缀 / 太短 / 空)，再问一次，仍不对就停止。
+3. **用 file write tool 写**(不是 PowerShell `setx` / 不是系统 env / 不要碰 `~/.bashrc`):
+   - 路径：`%USERPROFILE%\.config\game-ad-imagegen\config.toml`（Windows）/ `~/.config/game-ad-imagegen/config.toml`（Unix）
+   - 内容：
+     ```toml
+     ephone_api_key = "<user 贴的 key>"
+     ```
+   - 如果 user 贴的 key 是真 OpenAI key（`sk-proj-...` 前缀 / 已知是 platform.openai.com 的）→ 改写 `openai_api_key = "..."` + `openai_base_url` 字段缺省（让 SDK 走 OpenAI 默认）
+4. **不要**在 chat 里 echo 完整 key（确认收到说"已保存"即可）。
+5. **重新跑** `python scripts/image_gen.py ...` — `_config.py.load_credentials()` 会自动读到 config.toml，不需要重启 WorkBuddy / 不需要设 env。
+
+### 手动配置(给已经懂的开发者参考)
+
+任选一种(脚本会按优先级 0 → 4 找):
+
+- (路 0) `OPENAI_API_KEY` env + `OPENAI_BASE_URL` env(标准 OpenAI SDK 兼容)
+- (路 1) `GAME_AD_IMAGEGEN_EPHONE_KEY` env(skill 专用)
+- (路 2) `EPHONE_API_KEY` env(项目通用)
+- (路 3) `~/.config/game-ad-imagegen/config.toml`(agent setup wizard 写的)
+
+### 装依赖
+
+```bash
+pip install openai pillow
+```
+
+## 已验证用例
+
+⚠️ 故意不在 skill 里放 examples——一旦写具体题材就会变成"试跑命中"陷阱(agent 会按 examples 里见过的角色 / 风格自动复现)。需要 case 参考时跟开发者要 baseline outputs。**不要从外部翻历史 examples 找参考**。
+
+## 演化路径
+
+- **现版本（Phase 2.0）**：装在 claude-code / workbuddy 里，agent 自己在 Step 1-4 用 vision + LLM 思考
+- **Phase 2.1**：包成 FastAPI + 前端表单，部署到团队共享服务器，让设计部任何人浏览器打开就能用
+- 远景：自建 agent 框架（替换 LLM 层为 deepseek-v4-pro 跑 rewriting 省钱），image_gen 调用层不变
+
+## 相关文档
+
+- 设计原则、测试方法、实验结果等开发者文档不随 skill 分发;有需要可查 `git log` 或开 issue 询问。

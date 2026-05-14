@@ -1,0 +1,15 @@
+{
+  "batch_id": "fixture_bad_empty_prompt",
+  "skill": "a",
+  "out_dir": "~/Desktop/game-ad-imagegen-out/fixture_bad_empty_prompt/",
+  "size": "1536x1024",
+  "quality": "medium",
+  "tasks": [
+    {
+      "task_id": "t01",
+      "reference_images": ["./fixtures/sample_ref.png"],
+      "prompt": "",
+      "n": 1
+    }
+  ]
+}
