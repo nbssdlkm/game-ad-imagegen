@@ -440,6 +440,65 @@ batch UX **不预设图片角色**——`reference_images` 就是一个有序列
 - ❌ **不要** 改 `reference_images` 顺序：顺序对应用户 prompt 里"图1/图2/图3"，照用户排的传给 rewrite_prompt。
 - ❌ **不要** 试 ToolSearch / 任何 runtime-provided ImageGen wrapper：batch UX 永远走 `scripts/image_gen.py`，跟 `scripts/rewrite_prompt.py` 配对。
 - ❌ **不要** 主动开多个 batch 并发跑同 task：token 翻倍且无质量提升。
+- ❌ **不要** 主动重发触发短语 / 重启 batch_runner：1 个 config 对应 1 个 batch_runner 进程,重启会让多进程同写文件 race。如果 batch 看着卡了,先 tail log / check `_batch_meta.json` 而非盲重启。
+
+---
+
+### Anchor workflow (`anchor_candidates ≥ 2` 时自动启用) — 2026-05-14 新增
+
+**目的**: 解决 standard mode 两个失败模式 — (1) 单次 API 抽卡随机 (2) N 张独立 call 风格漂。**镜像网页版 ChatGPT 的 first-image-anchor 机制**:先生成 M 张候选 → user 挑 1 张作 anchor → anchor 喂回作 ref 跑剩余 N-1 张 → 系列风格统一。
+
+**触发**: config.json 内任一 task 设 `"anchor_candidates": M` (2 ≤ M ≤ 10) **且** `n ≥ 2` → batch_runner 自动 detect + 走 anchor workflow (校验阶段已有约束:M ≥ 2 + n ≥ 2,否则报错)。
+
+**三阶段流程** (batch_runner 内部跑,跟 standard mode 自动分支):
+
+```
+Phase 1: 同段 prompt × M sampling → M 张候选 (`{task_id}_anchor_cand_{ci:02d}.png`)
+   ↓ Phase 1 跑完后,batch_runner:
+      - 渲染 `anchor_pick.html` 到 out_dir (内含所有 M 候选缩略图 + radio + 提交 button)
+      - 写 `_batch_meta.json` 把 status 改成 "awaiting_picks"
+      - 写 `{batch_id}_anchor_pick_ready.txt` 给 user 看的 instructions
+   ↓
+Phase 2: batch_runner poll `{batch_id}_anchor_picks.json` (每 30s, timeout 30 min)
+   ↓ user 在浏览器挑 → 下载/复制 picks JSON → 保存到 out_dir
+   ↓ JSON 格式: { "task_id_1": 2, "task_id_2": 1, ... }  (value = 1..M 的 int)
+   ↓
+Phase 3: 自动接力,无需 agent 介入:
+   - 把 picked candidate 复制成 `{task_id}_01.png` (第 1 张正式输出)
+   - rewrite N-1 段 prompt with `anchor_phase="phase3"` (LLM 锁 85% faithful to picked anchor)
+   - picked anchor png 加到 image_gen refs 末尾,跑 N-1 张 series
+```
+
+**🚨 Phase 2 agent 行为 — critical**:
+
+- **agent 看到 `_batch_meta.json` status="awaiting_picks"** = 等待用户操作的标志,不是卡死
+- 通知 user **去浏览器挑选**,告知 `anchor_pick.html` 路径 + picks JSON 应保存到哪
+- ❌ **绝对不要 agent 自己写 picks JSON** — anchor pick 必须 user 决定 (审美 + 业务判断,LLM 看图选不出"塔夫满意的那张"):
+  - ❌ 错误示例:agent 用 vision tool 看 candidates → 自己挑 → write picks JSON → batch_runner 接力 = 完全失去 anchor workflow 的意义 (anchor 没经过人工把关)
+  - ✅ 正确示例:"Phase 1 跑完了,3 张候选在 `<path>/t01_anchor_cand_01..03.png`。请打开 `<path>/anchor_pick.html` 挑选 1 张满意的作为系列 anchor,提交后会下载一个 picks JSON,把它保存到 `<path>/<batch_id>_anchor_picks.json`,batch_runner 30s 内会自动接力跑 Phase 3。"
+
+**Token 经济**: 总图数 = M + N (M 候选 + 1 copied anchor + N-1 generated series)。M=3 + N=5 = **8 张图 token** (vs 标准 5 张,+60%)。换质量 + 解抽卡 + 锁系列风格。
+
+**Config 字段示例**:
+```json
+{
+  "tasks": [{
+    "task_id": "t01",
+    "anchor_candidates": 3,
+    "n": 5,
+    "reference_images": [...],
+    "prompt": "..."
+  }]
+}
+```
+
+**校验约束** (batch_runner 启动前 reject):
+- `anchor_candidates` ∈ {0, 2-10} (0 / 缺省 = 关闭; 1 = 无效; >10 = 上限拦)
+- `anchor_candidates ≥ 2` 时必须 `n ≥ 2`,否则 anchor mode 没意义 (出 M 候选给 user 挑结果只跑 1 张)
+
+**与 standard mode 同 batch 混用 OK**:同一 config 可以多 task,有的设 anchor_candidates 有的不设。standard task 先跑完,anchor tasks Phase 1 跑完后统一 poll picks (一次 JSON 含所有 anchor tasks 的 picked_idx)。
+
+**timeout 行为**: Phase 2 等 30 min 没等到 picks JSON → batch_runner 写 `{batch_id}_anchor_pick_TIMEOUT.txt` + skip Phase 3 + 退出。Phase 1 候选 PNG 仍在 disk,user 可后续手动挑(将来加 `--resume` 支持)。
 
 ### 失败时的 fallback
 
