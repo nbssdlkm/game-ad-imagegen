@@ -109,6 +109,7 @@ def run_one(prompt_file: Path, refs: list[Path],
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
             env=env, bufsize=1,
+            creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
         )
         # iter(proc.stdout.readline, '') 比 `for line in proc.stdout` 更稳
         for line in iter(proc.stdout.readline, ''):
@@ -174,6 +175,11 @@ def main():
     ap.add_argument("config", help="config.json (由本 skill 的 batch_form.html 生成)")
     ap.add_argument("--dry-run", action="store_true",
                     help="只做校验 + 打印将执行的命令,不真调 image_gen.py(省 credit)")
+    ap.add_argument("--no-rewrite", action="store_true",
+                    help="跳过 vision + rewrite step，直接把 config 里的 prompt 字面喂给 image_gen.py。"
+                         "向后兼容已自己 rewrite 好英文 prompt 的旧 config。"
+                         "也可在 config 里加 \"prompt_already_rewritten\": true 全批跳过，"
+                         "或在单个 task 里加同名字段单 task 跳过。")
     args = ap.parse_args()
 
     cfg_path = Path(args.config)
@@ -292,8 +298,39 @@ def main():
         task_size = task.get("size") or batch_size
         task_quality = task.get("quality") or batch_quality
 
+        # === Vision + Rewrite (Mode 2 → 跟 Mode 1 对齐的核心能力) ===
+        # 默认把用户中文需求 rewrite 成详细英文 image-gen prompt(T9 模板),
+        # 让 Mode 2 (form / 跑批) 也享受 skill 的核心 rewrite 能力。
+        # 跳过条件:
+        #   - CLI --no-rewrite flag (向后兼容)
+        #   - cfg.prompt_already_rewritten == true (全批跳过)
+        #   - task.prompt_already_rewritten == true (单 task 跳过)
+        skip_rewrite = (
+            args.no_rewrite
+            or cfg.get("prompt_already_rewritten")
+            or task.get("prompt_already_rewritten")
+        )
+
+        if skip_rewrite or args.dry_run:
+            rewritten_prompt = prompt
+            if skip_rewrite and not args.dry_run:
+                print(f"\n[task {task_id}] skip rewrite (prompt_already_rewritten / --no-rewrite)", flush=True)
+        else:
+            print(f"\n[task {task_id}] vision + rewrite step ({len(refs)} refs)...", flush=True)
+            try:
+                sys.path.insert(0, str(Path(__file__).parent))
+                from rewrite_prompt import rewrite as _do_rewrite
+                rewritten_prompt = _do_rewrite(prompt, refs)
+                # 存原始中文 prompt 作 debug trail
+                (out_dir / f"{task_id}_prompt_original.txt").write_text(prompt, encoding="utf-8")
+                print(f"[task {task_id}] rewrite done ({len(rewritten_prompt)} chars)", flush=True)
+            except Exception as e:
+                print(f"! [task {task_id}] rewrite failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+                print(f"  falling back to original prompt — image quality may suffer", file=sys.stderr, flush=True)
+                rewritten_prompt = prompt
+
         prompt_file = out_dir / f"{task_id}_prompt.txt"
-        prompt_file.write_text(prompt, encoding="utf-8")
+        prompt_file.write_text(rewritten_prompt, encoding="utf-8")
 
         for i in range(1, n + 1):
             img_seq += 1
