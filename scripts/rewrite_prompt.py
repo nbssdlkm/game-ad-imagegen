@@ -132,7 +132,7 @@ def _strip_fence(text: str) -> str:
     return text
 
 
-def rewrite(user_prompt: str, reference_images, n: int = 1, model: str = None, verbose: bool = False, anchor_phase: str = None) -> list:
+def rewrite(user_prompt: str, reference_images, n: int = 1, model: str = None, verbose: bool = False, anchor_phase: str = None, anchor_idx: int = None) -> list:
     """vision + rewrite。返回 list[str] of length n。
 
     输入:
@@ -186,17 +186,21 @@ def rewrite(user_prompt: str, reference_images, n: int = 1, model: str = None, v
     else:
         user_text += f"\n\n[runner instruction] Produce 1 prompt (single output image)."
 
-    # Anchor workflow Phase 3: 最后一张 ref 是用户挑选的 anchor,锁视觉风格
+    # Anchor workflow Phase 3: caller 指定 anchor_idx (或默认最后一张) — caller 必须保证该 idx 处是 picked anchor
     if anchor_phase == "phase3" and len(ref_paths) >= 1:
-        anchor_idx = len(ref_paths)
+        # caller 显式传 anchor_idx 时用 caller 的;不传则默认最后一张(向后兼容)
+        if anchor_idx is None:
+            anchor_idx = len(ref_paths)
+        if anchor_idx < 1 or anchor_idx > len(ref_paths):
+            raise ValueError(f"anchor_idx={anchor_idx} 超出 refs 范围 1..{len(ref_paths)}")
         user_text += (
-            f"\n\n[ANCHOR LOCK MODE — Phase 3] Image {anchor_idx} (the LAST reference image) is the "
+            f"\n\n[ANCHOR LOCK MODE — Phase 3] Image {anchor_idx} (out of {len(ref_paths)} ref images) is the "
             f"user-picked **anchor image** from a Phase 1 candidate round. It represents the LOCKED "
             f"visual style for this entire series — rendering technique, color palette, lighting, UI "
             f"layout, typography, composition language. Your {n} prompts MUST visually echo Image "
             f"{anchor_idx}'s style very tightly (**~85% faithful to anchor instead of the usual 70%**) "
             f"— only the primary character identity / pose / sidekick may vary across prompts. "
-            f"Images 1..{anchor_idx-1} provide character source material as before. "
+            f"All other reference images (not Image {anchor_idx}) provide character source material as before. "
             f"In each prompt, **explicitly write** at the end: "
             f"`Strictly match Image {anchor_idx}'s rendering style, palette, UI plate styling, and typography.` "
             f"The final output series (picked anchor + {n} new images) should look like one coherent "
@@ -236,8 +240,15 @@ def rewrite(user_prompt: str, reference_images, n: int = 1, model: str = None, v
     # 兜底 1: 如果 LLM 没产生 SEP (e.g. n 段被合并成 1 段),warn + 复制填满
     # 兜底 2: 如果产生了 != n 段,截断或复制最后一段填到 n
     if len(parts) == 0:
-        print(f"  [rewrite] WARN: LLM returned empty output", file=sys.stderr, flush=True)
-        return [text] * n  # 整段当 1 段重复
+        # text 可能完全为空(LLM 失败 / 超时) → 全空 prompt 喂 image_gen 必败
+        # 退到 user_prompt 让 image_gen 至少有内容跑 (虽然中文 prompt 在 form mode 会拼图,
+        # 但好过全空必败 — 至少 user 能看到原中文 prompt 跑出来的图,debug 路径清晰)
+        if not text:
+            print(f"  [rewrite] WARN: LLM returned empty output, falling back to original user_prompt × {n}", file=sys.stderr, flush=True)
+            return [user_prompt] * n
+        # text 有内容但没 SEP 标记 → 当 1 段 prompt 重复 n 次
+        print(f"  [rewrite] WARN: LLM returned content without SEP markers, treating as single prompt × {n}", file=sys.stderr, flush=True)
+        return [text] * n
 
     if len(parts) < n:
         print(f"  [rewrite] WARN: expected {n} prompts, got {len(parts)}; padding with last", file=sys.stderr, flush=True)

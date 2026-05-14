@@ -69,6 +69,16 @@ THIS_SKILL_ID = "a"                                        # 本 runner 只接 s
 IMAGE_GEN_PY = SCRIPTS_DIR / "image_gen.py"
 
 
+def _ensure_scripts_in_syspath():
+    """idempotent: 把 SCRIPTS_DIR 加到 sys.path 一次,防 inner 反复 insert 让 sys.path 无限增长。"""
+    s = str(SCRIPTS_DIR)
+    if s not in sys.path:
+        sys.path.insert(0, s)
+
+
+_ensure_scripts_in_syspath()
+
+
 def build_cmd(prompt_file: Path, refs: list[Path],
               out_path: Path, meta_path: Path, size: str, quality: str) -> list[str]:
     """构造 A 的 image_gen.py CLI。A 必须 ≥1 张图（校验阶段已保证）。"""
@@ -244,6 +254,14 @@ def main():
         n = int(t.get("n", 1))
         if n < 1 or n > 10:
             errors.append(f"{tid}: n 应在 1-10(实际 {n})")
+        # anchor_candidates 范围 + n>=2 配套校验
+        M_anchor = int(t.get("anchor_candidates", 0))
+        if M_anchor > 0 and M_anchor < 2:
+            errors.append(f"{tid}: anchor_candidates={M_anchor} 无效, 必须 ≥2 才启用 anchor mode (或 0/缺省关闭)")
+        if M_anchor > 10:
+            errors.append(f"{tid}: anchor_candidates={M_anchor} 超过上限 10 (太多候选浪费 token)")
+        if M_anchor >= 2 and n < 2:
+            errors.append(f"{tid}: anchor_candidates={M_anchor} (≥2) 但 n={n} (<2); anchor mode 需要 n>=2 才能产 N-1 张 series; 改 n>=2 或删 anchor_candidates")
 
     if errors:
         print(f"\n! 校验失败 ({len(errors)} 个问题):", file=sys.stderr)
@@ -264,7 +282,9 @@ def main():
     def _task_image_count(t):
         n = int(t.get("n", 1))
         if _is_anchor_mode(t):
-            return int(t["anchor_candidates"]) + (n - 1)
+            # anchor mode: M candidates (Phase 1) + n final outputs (1 picked-anchor copy + n-1 generated series)
+            # 注意:之前是 M + (n-1),少算了 picked anchor 那张 → img_seq 超界 1 张 (glm-5.1 review 抓出)
+            return int(t["anchor_candidates"]) + n
         return n
 
     n_images_total = sum(_task_image_count(t) for t in tasks)
@@ -303,7 +323,7 @@ def main():
         except Exception as e:
             print(f"  ! 增量写 _batch_meta.json 失败(忽略,继续跑): {e}", file=sys.stderr, flush=True)
         try:
-            sys.path.insert(0, str(Path(__file__).parent))
+            _ensure_scripts_in_syspath()
             from render_result_grid import render as _render
             _render(out_dir, partial_meta)
         except Exception as e:
@@ -346,7 +366,7 @@ def main():
             else:
                 print(f"\n[task {task_id}] (anchor Phase 1) vision + rewrite ({len(refs)} refs, M={M} candidates)...", flush=True)
                 try:
-                    sys.path.insert(0, str(Path(__file__).parent))
+                    _ensure_scripts_in_syspath()
                     from rewrite_prompt import rewrite as _do_rewrite
                     _cand_prompts = _do_rewrite(prompt, refs, n=1, anchor_phase="phase1")
                     cand_prompt = _cand_prompts[0]
@@ -420,7 +440,7 @@ def main():
             else:
                 print(f"\n[task {task_id}] vision + rewrite step ({len(refs)} refs, n={n})...", flush=True)
                 try:
-                    sys.path.insert(0, str(Path(__file__).parent))
+                    _ensure_scripts_in_syspath()
                     from rewrite_prompt import rewrite as _do_rewrite
                     rewritten_prompts = _do_rewrite(prompt, refs, n=n)
                     (out_dir / f"{task_id}_prompt_original.txt").write_text(prompt, encoding="utf-8")
@@ -479,7 +499,7 @@ def main():
     if anchor_pending_tasks and not args.dry_run:
         # 渲染 anchor_pick.html (默认 UI;技术团队可自行替换)
         try:
-            sys.path.insert(0, str(Path(__file__).parent))
+            _ensure_scripts_in_syspath()
             from render_anchor_pick import render as _render_pick
             pick_html = _render_pick(out_dir, batch_id, anchor_pending_tasks)
             print(f"\n📋 anchor_pick.html ready: {pick_html}", flush=True)
@@ -604,14 +624,20 @@ def main():
 
             # Rewrite N-1 段 with anchor_phase="phase3"
             # refs dedup: picked_path 罕见情况下可能已在 refs 列表(用户用某 ref 同一文件做 anchor candidate),
-            # 加 dedup 防重复喂 vision token
+            # 加 dedup 防重复喂 vision token + **显式传 anchor_idx** 给 rewrite,
+            # 否则 rewrite 硬编码 "最后一张 = anchor" 在 dedup 不 append 时指向错误图(glm review 抓出)
             new_refs = list(refs)
-            if picked_path not in new_refs:
+            if picked_path in new_refs:
+                # picked 已在 refs 列表 → 用其原位置作为 anchor_idx
+                anchor_idx = new_refs.index(picked_path) + 1  # 1-based
+            else:
+                # 正常情况 → append 末尾 + anchor_idx = 末尾位置
                 new_refs.append(picked_path)
+                anchor_idx = len(new_refs)
             try:
-                sys.path.insert(0, str(Path(__file__).parent))
+                _ensure_scripts_in_syspath()
                 from rewrite_prompt import rewrite as _do_rewrite
-                series_prompts = _do_rewrite(prompt, new_refs, n=n_series, anchor_phase="phase3")
+                series_prompts = _do_rewrite(prompt, new_refs, n=n_series, anchor_phase="phase3", anchor_idx=anchor_idx)
                 total_chars = sum(len(p) for p in series_prompts)
                 print(f"[task {task_id}] Phase 3 rewrite done ({len(series_prompts)} prompts, {total_chars} chars, anchor-locked)", flush=True)
             except Exception as e:
@@ -678,7 +704,7 @@ def main():
 
     # 最终渲染 result_grid.html
     try:
-        sys.path.insert(0, str(Path(__file__).parent))
+        _ensure_scripts_in_syspath()
         from render_result_grid import render
         grid_path = render(out_dir, batch_meta)
         print(f"  grid -> {grid_path}", flush=True)

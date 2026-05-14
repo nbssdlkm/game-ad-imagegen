@@ -49,7 +49,8 @@ def render(out_dir: Path, batch_id: str, anchor_pending_tasks: list) -> Path:
         })
 
     # JSON for embedding in <script>
-    tasks_json = json.dumps(tasks_data, ensure_ascii=False)
+    # 防 XSS / 页面破碎: 把 `</` 转义成 `<\/` 防 prompt 或 task_id 含 `</script>` 子串导致 script 块提前关闭
+    tasks_json = json.dumps(tasks_data, ensure_ascii=False).replace("</", "<\\/")
     # 完整 picks_file path 给 user 落盘参考(JS 端在 Submit 后会动态生成"包含真实 picks 的 PowerShell 命令")
     picks_file_full_path = str((out_dir / picks_file_name).resolve()).replace("\\", "\\\\")
 
@@ -317,8 +318,10 @@ document.getElementById('genJson').addEventListener('click', () => {{
   window._currentJsonText = jsonText;
 
   // 动态更新 PowerShell 一行命令(含实际 picks),user 可选复制粘贴到 terminal
+  // PS here-string @'...'@ 里 ' 字面要写成 '' (single → double single quote)
   const psCmd = document.getElementById('psCmd');
-  const psBody = '$json = @\\'\\n' + jsonText + '\\n\\'@ ; Set-Content -LiteralPath \\'' +
+  const jsonForPS = jsonText.replace(/'/g, "''");
+  const psBody = '$json = @\\'\\n' + jsonForPS + '\\n\\'@ ; Set-Content -LiteralPath \\'' +
                  PICKS_FILE_FULL_PATH + '\\' -Value $json -Encoding utf8';
   psCmd.textContent = psBody;
   psCmd.style.display = 'block';
