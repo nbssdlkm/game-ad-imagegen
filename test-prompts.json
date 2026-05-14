@@ -1,0 +1,20 @@
+[
+  {
+    "id": 1,
+    "prompt": "我有 1 张爆款参考图 + 3 张游戏实机图,帮我做 5 张游戏广告系列图,默认横版,角色用实机图里的,风格学爆款。",
+    "expected": "agent 走 Step 1 vision verify(verbatim 描述每张图实际内容)→ Step 2-3 拆解+选角色 → Step 4 rewriting 出 5 段独立 prompt → Step 5 跑 5 次 image_gen 或唤起 Batch UX。绝对不能凭文件名/题材词幻觉。",
+    "scenario": "happy path - 6 步 vision 流程,多张系列"
+  },
+  {
+    "id": 2,
+    "prompt": "我要批量出图",
+    "expected": "agent 静默起 python -m http.server 8765 + webbrowser.open web/batch_form.html,对话区只发一条简短通知(✅ 已打开 → URL),不二次确认 / 不问用户 ok 不 ok。",
+    "scenario": "Batch UX 触发 - form 模式入口"
+  },
+  {
+    "id": 3,
+    "prompt": "这张图(给一张已有广告图),把标题\"无敌战神\"改成\"霸天虎\",其他不动。",
+    "expected": "agent 识别为 case_05 形态(1 图 + 改文案),不路由去 B skill。走 A 的 Batch UX 或直接 image_gen,prompt 里 verbatim quote 原标题和目标标题。",
+    "scenario": "case_05 边界 - 单图改文案"
+  }
+]

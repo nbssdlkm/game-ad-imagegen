@@ -43,9 +43,21 @@ LLM agent 检测到下列条件命中时启动 skill：
 | ✅ ~70% 锚定参考图实际看到的内容，~30% 创作变化 | 风格 / 构图 / 角色形象基于 vision 实际看到的参考图内容 | 100% 复制参考图 = 失败；过度发挥脱离参考图 = 失败 |
 | ✅ 角色/资产从用户实际提供的图里选 | 不能凭空发明用户没给的角色 | 凭训练先验幻觉一个用户没给的角色 = 失败 |
 
-> ⚠️ **历史 case_15 形态偏见 fixed**：`_config.py.QUALITY_INVARIANTS` 文本之前含 "first image = Image A (style anchor)" 等 case_15 二分假设，对 case_09 (5 实机)/case_24 (2 爆款) 等其他形态有害。Batch UX 段用 `--no-invariants` 绕开了这个偏见；主流程 Step 1-4 在 2026-05-13 一并改 generic，由 vision 决定每张图用途，不预设。
+## 两种执行 Mode 总览
 
-## 6 步操作流程
+| Mode | 何时用 | 流程 | agent 负担 |
+|---|---|---|---|
+| **Mode 1: Interactive** (下方 "6 步操作流程") | 用户在对话区给参考图 + 中文 prompt,**让 agent 帮 vision 看图 + rewrite prompt** | Step 1-6 (vision verify → 拆解 → 选角色 → rewrite → image_gen → 归档) | 重(agent 写 prompt) |
+| **Mode 2: Form-driven** (下方 "Batch UX") | 设计师 self-serve,**用户在 HTML 表单里直接写好中文 prompt + 指定图路径**,agent 只做执行器 | 唤起 form → 用户填 → batch_runner 跑 | 轻(agent 不 vision / 不 rewrite) |
+
+**路由决策**:
+- 用户对话区已给完整 prompt + 参考图 → **Mode 1**(走 Step 1-6)
+- 用户说"我要批量出图" / "做几张图"等 **没给具体 prompt** → **Mode 2**(唤起 form)
+- 用户已经在 form 里填好,粘 config.json / 说"跑 batch_xxx" → **Mode 2 触发段**
+
+---
+
+## Mode 1: 6 步操作流程
 
 > ⚠️ **不要从外部翻历史模板或角色 lookup 取字段**。所有角色与构图字段一律由 Step 1 的 vision call 从用户当次输入图抓取。
 
@@ -117,56 +129,37 @@ UserIntent:    { 输出张数: N,
 
 ---
 
-### Step 4: Prompt rewriting（核心，agent 自己写英文 prompt）
+### Step 4: Prompt rewriting(核心,agent 自己写英文 prompt)
 
-把用户的中文需求 + Step 1-3 输出，**改写成 N 段详细英文 prompt**，每段对应 1 张图（1 个角色）。
+把用户的中文需求 + Step 1-3 输出,**改写成 N 段详细英文 prompt**,每段对应 1 张图。所有字段(角色视觉 / StyleSummary / 构图)只从 Step 1 vision call 当次抓取的内容填,**不要从外部翻历史模板或角色 lookup**。
 
-⚠️ **不要外部模板套**：所有字段（角色视觉、StyleSummary、构图）只从 Step 1 vision call 当次抓取的内容填，不要从外部翻历史模板或角色 lookup。
+**为什么 prompt 字面精度直接决定结果**:`image_gen.py` 切到 `/v1/images/edits` 端点后,**prompt 字面就是 image model 收到的,没有 L2 rewriter 二次改写**。verbatim 中文准确度靠 agent 字面精度,scene complexity 直接决定 image model text 渲染 budget。
 
-**每段 prompt 必须包含**（字段口语化，不强制 schema 结构）：
-1. 整体格式声明：`Create a polished horizontal game-promo poster in 1536x1024, aspect ratio 16:9.`（或用户指定的尺寸映射到合法 size）
-2. **每张图独立 labeling**——按 Step 1 PerImageNotes 写:`Image 1 (<role from PerImageNotes>): <key_visuals 实际看到的视觉摘要>. Image 2 (<role>): <...>. ...` 每张图独立角色,**不要 collapse 成"Image A primary style / Image B/C source"二分**(那是固定形态偏见,对单图修改 / 多实机图组合 / 风格融合 等其他形态有害)。
-   - 通用示例(填 Step 1 实际识别出的内容):`Image 1 (<vision 判断的 role,如 style+构图 anchor>): <vision 实际看到的视觉关键词>. Image 2 (<vision 判断的 role,如 角色源>): <vision 实际看到的视觉关键词>.`
-3. 角色定位:`Use the hero/subject visually identified in Image <N> as the main figure` —— **基于 Step 1 PerImageNotes + CandidatePool 实际识别的内容**,不凭训练先验幻觉用户没给的角色。
-4. 角色视觉:从 Step 1 CandidatePool 视觉描述照贴(**不从外部 lookup 取**)。
-5. 构图细节:从 Step 1 StyleSummary 视觉描述照贴(**不套固定"comic inset / speech bubble / bottom CTA"模板**——如果参考图是别的版式就跟着参考图)。
-6. 标题 + 气泡 + 副文案 + CTA(**all readable 中文 text rendered in image, NOT blank for later overlay**)。如果参考图已含中文文字(PerImageNotes.chinese_text_in_image 非空),prompt 里**显式 verbatim quoted 列出**原文字(例:`Title bar (verbatim): "<vision 看到的原标题>"`),不写英文描述("the calligraphy title" 这种是错的,模型会留空白)。
-7. 风格质量:从 Step 1 StyleSummary.整体氛围 选——基于 vision 实际看到的视觉风格词写英文描述(如 `polished 2D illustration` / `semi-realistic painterly CG` / `stylized concept art` 之类英文风格语,**vision 看到什么就写什么,不从题材 lookup 取**)。
-8. 约束:`No phone UI / FPS overlay / vConsole / watermark / app-store badges / blank text containers`。**绝对不写** `do NOT render readable words` 这种反向指令(已知失败模式:agent 没读到图时,保守写"不渲染文字",让所有标题位置变成空白框)。
+#### 必须遵守的原则(case_24 / case_09 / case_04 跨场景验证)
 
-**绝对禁止**：
-- 在 prompt 里写 `Text (verbatim): none. Leave blank.` 或 `no Chinese characters` → 留白叠字反模式
-- 写任何题材 hardcoded lookup → 失普适性
-- 把 Step 1 vision 没看到的元素塞进 prompt → 凭空发明
-- 堆 multi-panel 多场景 / 多 hero / 8+ text 位置（**会稀释 image model 的 text 渲染精度**，2026-05-12 case_24 实证）
-
----
-
-### Step 4 范本：T9 风格 prompt（2026-05-12 强约束）
-
-**关键约束**(基于 case_24 / case_09 / case_04 跨场景验证 — recipe 文档在开发者本地工作区,设计师不需要):
-
-1. **单 hero focus**：1 个主体角色 + ≤2 个副角（inset 头像 / sidekick / 小兵反应）。**不要堆 multi-panel 多场景**。
-2. **4-7 个显式 Chinese text 位置**（标题 + 主 CTA + speech bubble + small caption + tag/stamp 等）。少于 3 个空虚，**多于 7 个稀释 image model text 精度**。
-3. **每个中文 text 字面 quoted 列出**：写 `Large stylized title at top: "<游戏标题>"`（用实际中文字面，不是 `"the calligraphy title"` 这种英文描述）。
-4. **70% faithful 30% creative 显式写**：在 prompt 末尾加 `Keep about 70% faithful to reference style, 30% creative variation`。
-5. **bullet list 组织 main content**（不用 13 字段 schema）：
-   ```
-   Main content requirements:
-   - {Central hero: 视觉描述 + pose}
-   - {Background: atmosphere + key props}
-   - Large stylized title at top in {style}: "{TITLE}".
-   - Main promotional banner: "{MAIN_TEXT}".
-   - {Optional speech bubble}: "{BUBBLE_TEXT}".
-   - {Optional small inset/stamp}: "{SIDE_TEXT}".
-   ```
-6. **强约束** 必须加在 Quality and style requirements 段：
+1. **单 hero focus**:1 个主体角色 + ≤2 个副角(inset 头像 / sidekick / 小兵反应)。不要堆 multi-panel 多场景 / 8+ text 位置 → 稀释 image model text 精度(case_24 实证)。
+2. **4-7 个显式 Chinese text 位置**(标题 + 主 CTA + speech bubble + small caption + tag/stamp)。<3 个空虚,>7 个稀释。
+3. **每个中文 text 字面 quoted 列出**:写 `Large stylized title at top: "<游戏标题>"`(用实际中文字面,不是 `"the calligraphy title"` 这种英文描述,模型会留空白)。
+4. **每张图独立 labeling**:`Image 1 (<role from PerImageNotes>): <key_visuals>. Image 2 (<role>): ...` 每张图独立角色,**不要 collapse 成 "Image A primary style / Image B/C source" 二分**(case_15 形态偏见,对单图修改 / 多实机图 / 风格融合 有害)。
+5. **70% faithful 30% creative 显式写**:`Keep about 70% faithful to reference style, 30% creative variation`。
+6. **角色定位 + 视觉描述照贴 CandidatePool**:`Use the hero visually identified in Image <N>` + 服装色 / 武器 / 五官 / 标志特征。不凭训练先验幻觉用户没给的角色。
+7. **风格词从 Step 1 StyleSummary.整体氛围 取**(如 `polished 2D illustration` / `semi-realistic painterly CG` / `stylized concept art`),不从题材 lookup 取。
+8. **强约束**(加在 Quality and style requirements 段):
    - `All Chinese text rendered crisply and readably DIRECTLY in the image`
    - `Do NOT leave any text container blank`
    - `Do NOT use placeholder pseudo-Chinese`
-   - `Do NOT use English subtitles` （防 GLM 等纯英文模型偏题）
+   - `Do NOT use English subtitles`(防 GLM 等纯英文模型偏题)
+   - `No phone UI / FPS overlay / vConsole / watermark / app-store badges / blank text containers`
 
-**结构骨架**（distilled from 2229 字符英文工程化结构，跨场景验证 0 错字；不需要查外部模板）：
+#### 绝对禁止
+
+- 在 prompt 里写 `Text (verbatim): none. Leave blank.` 或 `no Chinese characters` → 留白叠字反模式
+- 写 `do NOT render readable words` 反向指令 → agent 没读到图时保守留空白
+- 写任何题材 hardcoded lookup → 失普适性
+- 把 Step 1 vision 没看到的元素塞进 prompt → 凭空发明
+
+#### Ready-to-use 骨架(跨场景验证 0 错字,不用查外部模板)
+
 ```
 Create a polished {orientation} {asset type} in {WxH}, aspect ratio {ratio}.
 Image 1 (<role: e.g. "style+构图 anchor" / "角色源" / "UI 模板" / "改文案目标">): {describe what Image 1 actually shows — from Step 1 PerImageNotes.key_visuals}.
@@ -177,16 +170,20 @@ Design a brand-new composition echoing the style anchor image's visual language 
 adapting to {orientation/ratio}. Keep about 70% faithful, 30% creative.
 
 Main content requirements:
-- {bullet list of 4-7 items, each with explicit "中文 text" if applicable}
+- {Central hero: 视觉描述 + pose}
+- {Background: atmosphere + key props}
+- Large stylized title at top in {style}: "{TITLE}".
+- Main promotional banner: "{MAIN_TEXT}".
+- {Optional speech bubble}: "{BUBBLE_TEXT}".
+- {Optional small inset/stamp}: "{SIDE_TEXT}".
 
 Quality and style requirements:
-- {No raw screenshot artifacts / phone UI / FPS / watermarks}
-- {Polished commercial finish, specific style notes}
-- {Orientation} composition only, {WxH}.
 - All Chinese text rendered crisply and readably DIRECTLY in the image.
+- Do NOT leave any text container blank / use placeholder pseudo-Chinese / use English subtitles.
+- No raw screenshot artifacts / phone UI / FPS / watermarks / app-store badges.
+- {Polished commercial finish, specific style notes from StyleSummary}.
+- {Orientation} composition only, {WxH}.
 ```
-
-**为什么这套约束**：image_gen.py 已切到 `/v1/images/edits` 端点（recipe 版 2026-05-12），**prompt 字面就是 image model 收到的，没有 L2 rewriter 二次改写或简化**。所以 verbatim 中文准确度直接靠 agent 写 prompt 的字面精度，scene complexity 也直接决定 image model 处理 budget 分配。
 
 ---
 
@@ -236,9 +233,8 @@ python scripts/image_gen.py \
   --meta-out <临时输出目录>/01_meta.json
 ```
 
-第 1 张作风格基准。完成后检查：
-- HTTP 200 + meta_json 落盘 + PNG 文件大小 > 0
-- ~~meta_json.revised_prompt 非 None~~ → **过时**: `/v1/images/edits` 端点不返回 `revised_prompt`(该字段是 `/v1/responses + image_gen tool` 路径独有)。recipe 切到 edits 端点后这个检查不再适用,**改成检查 `http_status == 200 + 文件大小 > 0`**
+第 1 张作风格基准。完成后检查:
+- HTTP 200 + meta_json 落盘 + PNG 文件大小 > 0(`/v1/images/edits` 端点不返回 `revised_prompt`)
 - PNG 含 readable Chinese text(不是空白)
 
 **多图（N ≥ 2）调用** — 两条路径，按场景选：
@@ -246,8 +242,6 @@ python scripts/image_gen.py \
 **(推荐) 走 Batch UX 段** — HTML 表单触发 + 本 skill 内 `scripts/batch_runner.py`,见本文档后面 "Batch UX (HTML 表单触发模式)" 段。设计师推广路径走这条,agent 也可以直接调(agent 写好 config.json → 调 `python ~/.claude/skills/game-ad-imagegen/scripts/batch_runner.py <config.json>`,runner 调本 skill 的 image_gen.py,多 task / 不同 prompt / 多 n)。
 
 **(简单循环) agent 自己跑 N 次** — 把 Step 4 写的 N 段 prompt 各自写到临时文件，循环调 `python scripts/image_gen.py --prompt-file ... --refs <所有用户参考图都传> --out <i>.png` N 次。每次传**所有用户参考图**，让 image model 根据 prompt + 参考图上下文自己保系列一致性。简单直接，不需要 anchor strategy。
-
-> Phase 1 历史接口 `image_gen_batch.py --config batch.json`（含 `anchor_strategy="first"` 跨调用串图）已保留在 `scripts/` 供历史 case 兼容，但**新推广不用**——它假设"第 1 张当 anchor 喂给后续调用"是 case_04 形态偏见（5 张系列广告场景），对 case_05 (1 张改文案) / case_24 (2 张风格融合) 等其他形态没有意义。推广路径走 Batch UX 或简单循环。
 
 ---
 
@@ -270,7 +264,7 @@ python scripts/save_outputs.py \
 
 ---
 
-## Batch UX (HTML 表单触发模式)
+## Mode 2: Batch UX (HTML 表单触发模式)
 
 本 skill **自包含**一套批量 HTML 表单 + runner,供设计师跑多任务时用。**本表单专属本 skill,生成的 config.json 写死 `skill: "a"`,runner 也只跑本 skill。** 如果用户想用 B skill 走另一条独立路径,B 有自己的 `web/batch_form.html` + `scripts/batch_runner.py`,本 skill 不知道也不关心 B 的实现。
 
@@ -470,7 +464,6 @@ batch UX **不预设图片角色**——`reference_images` 就是一个有序列
 | 现象 | 诊断 | 处理 |
 |---|---|---|
 | image_gen HTTP 4xx/5xx | API key 无效 / 配额耗尽 / 参考图过大 | 检查 EPHONE_API_KEY；缩小参考图 |
-| ~~revised_prompt = None~~ | **不是失败模式** — recipe 切 `/v1/images/edits` 端点后此字段恒为 null,这是正常的(该字段是 responses+tool 路径独有,edits 端点不返回)。文档 2026-05-13 已修正 | 不用处理 |
 | 图片字体单薄 / 错位 | 走错路线了，不要做 Pillow 后期叠字！ | 检查 Step 4 prompt 里是否误加了"留白"指令；image_gen 必须一次性画字 |
 | 输出图过度像参考图（人物特征 ≈ 参考图人物变体） | 参考图过度复刻：prompt 不够具体 | 强化 Step 4 的"角色身份从 Step 1 PerImageNotes 实际看到的图源取"约束 |
 | N 张序列视觉风格不一致 | 没把所有参考图都传给每次调用 | 简单循环模式：每次 `--refs <所有用户参考图>` 全传；走 Phase 1 老接口的话 `anchor_strategy="first"` |
@@ -511,16 +504,6 @@ batch UX **不预设图片角色**——`reference_images` 就是一个有序列
 pip install openai pillow
 ```
 
-## 已验证用例
+## 已验证用例 + 演化路径 + 设计文档
 
-⚠️ 故意不在 skill 里放 examples——一旦写具体题材就会变成"试跑命中"陷阱(agent 会按 examples 里见过的角色 / 风格自动复现)。需要 case 参考时跟开发者要 baseline outputs。**不要从外部翻历史 examples 找参考**。
-
-## 演化路径
-
-- **现版本（Phase 2.0）**：装在 claude-code / workbuddy 里，agent 自己在 Step 1-4 用 vision + LLM 思考
-- **Phase 2.1**：包成 FastAPI + 前端表单，部署到团队共享服务器，让设计部任何人浏览器打开就能用
-- 远景：自建 agent 框架（替换 LLM 层为 deepseek-v4-pro 跑 rewriting 省钱），image_gen 调用层不变
-
-## 相关文档
-
-- 设计原则、测试方法、实验结果等开发者文档不随 skill 分发;有需要可查 `git log` 或开 issue 询问。
+skill 内**故意不放 examples**(防"试跑命中"陷阱)。需要 case 参考、设计原则、实验结果等开发者文档,查 `git log` 或开 issue。

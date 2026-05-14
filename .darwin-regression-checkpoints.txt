@@ -1,0 +1,40 @@
+# Regression checkpoints for SKILL.md edits
+# 每条都是"必须保留"的 invariant / fact / guard。
+# 改完后 Grep 验证;任一条丢失 → auto-revert。
+# 格式: <id>|<pattern - regex or literal substring>|<rationale>
+
+CP01|≥ ?1 张参考图|核心 trigger 约束(0 图走 B skill)
+CP02|真的看图|Step 1 强制 vision 加载 bytes
+CP03|Verify see|Step 1 强制 verbatim 输出每张图实际内容
+CP04|没 vision 能力的 model 不能跑此 skill|纯文本 model 必须主动 stop
+CP05|Text \(verbatim\): none\. Leave blank|失败模式反例(留白叠字反模式必须明文禁止)
+CP06|Pillow 后期叠字|失败模式核心反模式
+CP07|70%|"70% faithful 30% creative" 约束
+CP08|凭训练先验|防 hallucinated prompt 的核心警告
+CP09|不要二次确认|Batch UX 反向 example(看到触发词直接执行)
+CP10|launch_detached\.py|detach launcher 必走
+CP11|DETACHED\+BREAKAWAY|WorkBuddy 110s 杀子进程的解法标识
+CP12|config\.skill == "a"|runner reject 非 A 请求
+CP13|0 张图|A skill reject 形态(明确不支持)
+CP14|--no-invariants|Batch UX 终稿模式标识
+CP15|result_grid|跑批前唤起进度页(不是跑完才开)
+CP16|config\.toml|API key wizard 写文件路径
+CP17|EPHONE_API_KEY|API key env 名
+CP18|CandidatePool|Step 1-3 关键数据结构
+CP19|PerImageNotes|Step 1 vision 输出结构
+CP20|StyleSummary|Step 1 vision 输出结构
+CP21|Image 1|每张图独立 labeling 不 collapse 成 A/B/C
+CP22|case_15|历史 case 引用(至少在一处保留作 anti-pattern 案例)
+CP23|case_24|历史 case 引用
+CP24|case_09|历史 case 引用
+CP25|gpt-image-2|model 名 + 合法 size 来源
+CP26|1536x1024|默认 landscape size
+CP27|http\.server 8765|Batch UX 入口端口
+CP28|webbrowser\.open|跨 OS 浏览器调用
+CP29|/v1/images/edits|当前 API endpoint
+CP30|codex-imagegen-fork|B skill 名(差异化引用)
+CP31|失败模式|失败模式表 section 必须存在
+CP32|身份从 Step 1 CandidatePool|防训练先验 lookup
+CP33|不预设位置|防"图1=风格/图2=角色"二分偏见
+CP34|不允许 Pillow|失败模式明文约束
+CP35|task_id|config.json schema 关键字段
