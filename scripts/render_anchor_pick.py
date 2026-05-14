@@ -269,13 +269,26 @@ TASKS.forEach((task) => {{
     const card = document.createElement('label');
     card.className = 'cand-card';
     card.dataset.candIdx = ci;
-    card.innerHTML = `
-      <img src="${{candName}}" onerror="this.style.background='#fee';this.alt='?'">
-      <div class="label">
-        <input type="radio" name="pick_${{task.task_id}}" value="${{ci}}" required>
-        <span>候选 #${{ci}}</span>
-      </div>
-    `;
+    // 用 DOM API 而非 innerHTML 拼字符串 — 防 candName / task_id 含 quote/< 时
+    // XSS 注入(minimax-m2.7 review 抓出的真问题:innerHTML 拼接的攻击面)
+    const cardImg = document.createElement('img');
+    cardImg.src = candName;
+    cardImg.onerror = () => {{ cardImg.style.background = '#fee'; cardImg.alt = '?'; }};
+    card.appendChild(cardImg);
+
+    const labelDiv = document.createElement('div');
+    labelDiv.className = 'label';
+    const radio = document.createElement('input');
+    radio.type = 'radio';
+    radio.name = `pick_${{task.task_id}}`;
+    radio.value = String(ci);
+    radio.required = true;
+    labelDiv.appendChild(radio);
+    const span = document.createElement('span');
+    span.textContent = `候选 #${{ci}}`;
+    labelDiv.appendChild(span);
+    card.appendChild(labelDiv);
+
     card.addEventListener('change', () => {{
       grid.querySelectorAll('.cand-card').forEach(c => c.classList.remove('picked'));
       card.classList.add('picked');

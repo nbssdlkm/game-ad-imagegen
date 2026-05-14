@@ -534,6 +534,11 @@ def main():
         print(f"   2. Pick one anchor per task → save JSON to: {picks_file.name}", flush=True)
         print(f"   batch_runner polls every {ANCHOR_POLL_INTERVAL_SEC}s...\n", flush=True)
 
+        # 首次写一次 "awaiting_picks" 状态到 _batch_meta.json,让前端
+        # (result_grid.html / WB UI 等) 立刻能看到 status 变化 — 否则 30 min poll 期间
+        # status 一直停 "running" 让 user 误以为卡死(minimax-m2.7 review 抓出)
+        _write_incremental_progress(all_results, n_images_total, status="awaiting_picks")
+
         # Poll loop with timeout
         _poll_start = time.time()
         picks = None
@@ -560,6 +565,8 @@ def main():
                 break
             # print 用 sleep 前的当前 elapsed(语义最清晰: "已等了 X 秒,timeout Y 秒,下次 check 在 +30s 后")
             print(f"  ⏳ polling for {picks_file.name} ({int(_elapsed)}s elapsed / timeout {ANCHOR_POLL_TIMEOUT_SEC}s, next check in {ANCHOR_POLL_INTERVAL_SEC}s)...", flush=True)
+            # 持续更新 _batch_meta.json 的 elapsed_sec 让前端看到时间在动(否则 status 卡 awaiting_picks 30 min user 误以为死了)
+            _write_incremental_progress(all_results, n_images_total, status="awaiting_picks")
             time.sleep(ANCHOR_POLL_INTERVAL_SEC)
 
         # 如果 timeout 没拿到 picks,跳过 Phase 3 但仍写最终 meta(候选图保留供后续手动 review)
