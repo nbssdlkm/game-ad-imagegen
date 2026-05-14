@@ -275,7 +275,7 @@ python scripts/save_outputs.py \
 
 本 skill **自包含**一套批量 HTML 表单 + runner,供设计师跑多任务时用。**本表单专属本 skill,生成的 config.json 写死 `skill: "a"`,runner 也只跑本 skill。** 如果用户想用 B skill 走另一条独立路径,B 有自己的 `web/batch_form.html` + `scripts/batch_runner.py`,本 skill 不知道也不关心 B 的实现。
 
-**这条路径绕开 Step 1-4 的 vision/rewriting**(用户已在表单里手填中文 prompt + 直接给图路径),agent 只做执行器。
+~~这条路径绕开 Step 1-4 的 vision/rewriting~~ → **2026-05-14 已对齐(commit `5cdbf3c` + `bbab6be`)**: `batch_runner` 自带 vision + rewrite step(调 `scripts/rewrite_prompt.py`)跟 Mode 1 对齐。用户在表单里写中文需求即可,**不需要预先 rewrite**;agent 仍只做执行器(开 form / 喂 config / 报告进度),LM rewrite 由 runner subprocess 自动跑。
 
 **关键文件位置**(都在本 skill 内,跟 SKILL.md 同根):
 
@@ -408,7 +408,7 @@ agent 发一条简短消息(根据用哪个 tier 微调措辞):
 
 `python image_gen.py --prompt-file X --refs a.png,b.png --out C --meta-out M --size S --quality Q --no-invariants`
 
-`--no-invariants` = batch UX 终稿模式,不注入 `_config.py.QUALITY_INVARIANTS` 文本块(即使 invariants 现已 generic 化,batch UX 仍坚持"用户在表单里写的就是终稿,runtime 不加任何额外 system text"原则)。
+`--no-invariants` = 不在 image_gen 调用前注入 `_config.py.QUALITY_INVARIANTS` 文本块。**注**: 2026-05-14 之后 batch_runner 已在 image_gen 前跑了 vision + rewrite step,rewrite 输出的英文 prompt 已通过 system prompt 教 LLM 遵守 QUALITY 规则;再在 image_gen 前注入一次会双重灌指令、稀释 prompt budget,故 batch UX 仍传 `--no-invariants`(由 rewrite layer 接管 quality 约束)。
 
 ### 支持的形态（28 raw case 验证矩阵覆盖）
 
@@ -425,14 +425,21 @@ batch UX **不预设图片角色**——`reference_images` 就是一个有序列
 
 - **0 张图（纯文字生图 text2im）**：A 走 `/v1/images/edits`，至少要 1 张图。case_20 这种"生成第一人称视角的古代战场..."的纯描述请求 batch_runner 会校验失败 + 提示用户切换到 B skill（B 的 `generate` 子命令支持 text2im）
 
-### Batch UX 模式下要明确**不做**的事
+### Batch UX 模式下 agent 的边界（2026-05-14 重写，跟 scripts/ 对齐）
 
-- ❌ **不要** vision 重读图 / 重写 prompt：用户填的是什么就跑什么。表单里的 prompt 即终稿。
-- ❌ **不要** 给 image_gen 注入 QUALITY_INVARIANTS（batch_runner 已 `--no-invariants`）— batch UX 终稿模式认为用户在表单里写的就是终稿，runtime 不加任何额外 system text，让模型只看用户 prompt 原样跑。
-- ❌ **不要** 自动给 prompt 拼 anchor_strategy 串图：`n > 1` 时 agent 顺序跑 n 次独立调用，保持多样性。
-- ❌ **不要** Pillow 后期叠字：image_gen 一次性出图。
-- ❌ **不要** 主动给 prompt 加修饰词或英文化：表单 JSON 里的中文 prompt 原样传入。
-- ❌ **不要** 改 reference_images 顺序：顺序对应 prompt 里"图1/图2/图3"，用户自己排的就照跑，不要因为"觉得 X 张应该当 anchor"擅自重排。
+**✅ batch_runner 自动做的事**（agent 不要重复）：
+
+- ✅ Per-task vision + rewrite：`batch_runner` 调 `scripts/rewrite_prompt.py` 对每个 task 跑 vision + LM rewrite，把中文需求转成 N 段（N=task.n）英文 image-gen prompt。**agent 不要自己再 rewrite 一遍 / 不要在 config 里塞预 rewrite 好的英文 prompt**（除非 task 显式标 `prompt_already_rewritten: true`）。
+- ✅ N 段不同主体：`rewrite_prompt` 一次产 N 段独立 prompt，每段 feature 不同主体角色（系列多样性）。**agent 不要假设"5 张同 prompt 跑 5 次 sampling"**。
+- ✅ No QUALITY_INVARIANTS double-injection：`batch_runner` 调 `image_gen.py` 时传 `--no-invariants`，因为 rewrite layer 已经在 system prompt 里约束了 quality 规则。
+
+**❌ agent 仍不要做的事**：
+
+- ❌ **不要** Pillow 后期叠字：image_gen 一次性把所有中文 text 画进图里。
+- ❌ **不要** 主动给 `config.tasks[].prompt` 加修饰词或英文化：用户填的中文需求传给 rewrite_prompt，LM 自己 rewrite。
+- ❌ **不要** 改 `reference_images` 顺序：顺序对应用户 prompt 里"图1/图2/图3"，照用户排的传给 rewrite_prompt。
+- ❌ **不要** 试 ToolSearch / 任何 runtime-provided ImageGen wrapper：batch UX 永远走 `scripts/image_gen.py`，跟 `scripts/rewrite_prompt.py` 配对。
+- ❌ **不要** 主动开多个 batch 并发跑同 task：token 翻倍且无质量提升。
 
 ### 失败时的 fallback
 
