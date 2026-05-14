@@ -18,3 +18,6 @@ batch_*.json
 
 # launch_detached.py 在 scripts/ 内 append 写的 batch_runner log
 scripts/*_detached_launcher.log
+
+# WorkBuddy UI metadata — install.ps1/install.sh 装机时建,含 installedAt 装机时间戳,不该入 repo
+_skillhub_meta.json

@@ -54,6 +54,24 @@ if (Test-Path $WbSkills) {
   Write-Host "    [skip] No WorkBuddy install detected ($WbSkills missing)"
 }
 
+# 2b. _skillhub_meta.json — 让 WorkBuddy UI 在 skill 列表里能识别+显示本 skill
+#     (没这个 metadata 文件 WB UI 不显示,即使 junction 已建。亲测 2026-05-14)
+$MetaPath = Join-Path $SkillDir "_skillhub_meta.json"
+if (Test-Path $MetaPath) {
+  Write-Host "    [skip] _skillhub_meta.json already exists at $MetaPath" -ForegroundColor Yellow
+} else {
+  $now = [int64](([datetime]::UtcNow - (Get-Date "1970-01-01")).TotalMilliseconds)
+  $metaObj = [ordered]@{
+    name = $SkillName
+    installedAt = $now
+    source = "marketplace"
+    iconSource = $SkillName
+    version = "0.1.2"
+  }
+  $metaObj | ConvertTo-Json | Out-File -FilePath $MetaPath -Encoding UTF8
+  Write-Host "    Created $MetaPath (lets WorkBuddy UI list this skill)" -ForegroundColor Green
+}
+
 # 3. 验证依赖
 Write-Host ""
 Write-Host "==> Verifying dependencies" -ForegroundColor Cyan
