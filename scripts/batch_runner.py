@@ -497,13 +497,18 @@ def main():
         ready_msg_lines.extend(["}", ""])
         ready_file.write_text("\n".join(ready_msg_lines), encoding="utf-8")
 
-        print(f"\n⏸️ Phase 1 done — waiting for anchor picks", flush=True)
+        # Poll timeout 防 user 忘记挑选 / 浏览器关导致 batch_runner 永远挂着
+        ANCHOR_POLL_TIMEOUT_SEC = 1800  # 30 min
+        ANCHOR_POLL_INTERVAL_SEC = 30
+
+        print(f"\n⏸️ Phase 1 done — waiting for anchor picks (timeout {ANCHOR_POLL_TIMEOUT_SEC // 60} min)", flush=True)
         print(f"   1. Open: {out_dir / 'anchor_pick.html'}", flush=True)
         print(f"   2. Pick one anchor per task → save JSON to: {picks_file.name}", flush=True)
-        print(f"   batch_runner polls every 30s...\n", flush=True)
+        print(f"   batch_runner polls every {ANCHOR_POLL_INTERVAL_SEC}s...\n", flush=True)
 
-        # Poll loop
+        # Poll loop with timeout
         _poll_start = time.time()
+        picks = None
         while True:
             if picks_file.exists():
                 try:
@@ -512,9 +517,25 @@ def main():
                     break
                 except Exception as e:
                     print(f"  ! picks JSON 解析失败 (will retry): {e}", file=sys.stderr, flush=True)
-            time.sleep(30)
             _elapsed = round(time.time() - _poll_start, 0)
-            print(f"  ⏳ still polling for {picks_file.name} ({int(_elapsed)}s elapsed)...", flush=True)
+            if _elapsed >= ANCHOR_POLL_TIMEOUT_SEC:
+                print(f"\n⏰ Anchor pick TIMEOUT after {int(_elapsed)}s — abort batch (Phase 3 skipped for {len(anchor_pending_tasks)} task(s))",
+                      file=sys.stderr, flush=True)
+                print(f"   Phase 1 候选图保留在 out_dir,user 可后续手动挑选 + 重新跑 batch_runner --continue (待实现)",
+                      file=sys.stderr, flush=True)
+                # Write timeout marker for diagnostics
+                (out_dir / f"{batch_id}_anchor_pick_TIMEOUT.txt").write_text(
+                    f"Timed out at {time.strftime('%Y-%m-%d %H:%M:%S')} after {int(_elapsed)}s waiting for {picks_file.name}",
+                    encoding="utf-8",
+                )
+                picks = None
+                break
+            time.sleep(ANCHOR_POLL_INTERVAL_SEC)
+            print(f"  ⏳ still polling for {picks_file.name} ({int(_elapsed + ANCHOR_POLL_INTERVAL_SEC)}s elapsed, timeout at {ANCHOR_POLL_TIMEOUT_SEC}s)...", flush=True)
+
+        # 如果 timeout 没拿到 picks,跳过 Phase 3 但仍写最终 meta(候选图保留供后续手动 review)
+        if picks is None:
+            anchor_pending_tasks = []  # 让下面 Phase 3 循环不执行
 
         # Phase 3: 对每个 anchor task 跑 N-1 张 series
         for pending in anchor_pending_tasks:
@@ -561,19 +582,29 @@ def main():
             })
             _write_incremental_progress(all_results, n_images_total, status="running")
 
+            # 防御性 check: 当前 _is_anchor_mode 要求 n>=2 所以 n-1>=1,但加 check 防未来回归
+            n_series = n - 1
+            if n_series < 1:
+                print(f"[task {task_id}] Phase 3 skipped (n={n} → n-1={n_series} < 1, anchor + 0 series, picked anchor 已 copy 为唯一输出)", flush=True)
+                continue
+
             # Rewrite N-1 段 with anchor_phase="phase3"
-            new_refs = list(refs) + [picked_path]
+            # refs dedup: picked_path 罕见情况下可能已在 refs 列表(用户用某 ref 同一文件做 anchor candidate),
+            # 加 dedup 防重复喂 vision token
+            new_refs = list(refs)
+            if picked_path not in new_refs:
+                new_refs.append(picked_path)
             try:
                 sys.path.insert(0, str(Path(__file__).parent))
                 from rewrite_prompt import rewrite as _do_rewrite
-                series_prompts = _do_rewrite(prompt, new_refs, n=n - 1, anchor_phase="phase3")
+                series_prompts = _do_rewrite(prompt, new_refs, n=n_series, anchor_phase="phase3")
                 total_chars = sum(len(p) for p in series_prompts)
                 print(f"[task {task_id}] Phase 3 rewrite done ({len(series_prompts)} prompts, {total_chars} chars, anchor-locked)", flush=True)
             except Exception as e:
                 print(f"! [task {task_id}] Phase 3 rewrite failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-                series_prompts = [prompt] * (n - 1)
+                series_prompts = [prompt] * n_series
 
-            while len(series_prompts) < n - 1:
+            while len(series_prompts) < n_series:
                 series_prompts.append(series_prompts[-1])
 
             # 跑 N-1 张 series with picked anchor 在 refs 列表末尾

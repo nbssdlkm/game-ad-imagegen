@@ -50,14 +50,8 @@ def render(out_dir: Path, batch_id: str, anchor_pending_tasks: list) -> Path:
 
     # JSON for embedding in <script>
     tasks_json = json.dumps(tasks_data, ensure_ascii=False)
-    picks_template = {td["task_id"]: 1 for td in tasks_data}
-    picks_template_json = json.dumps(picks_template, ensure_ascii=False, indent=2)
-
-    # PowerShell 写入命令 (用户复制粘贴用)
-    ps_set_cmd = (
-        f'$json = @"\n{picks_template_json}\n"@ ; '
-        f"Set-Content -Path '{out_dir / picks_file_name}' -Value $json -Encoding utf8"
-    )
+    # 完整 picks_file path 给 user 落盘参考(JS 端在 Submit 后会动态生成"包含真实 picks 的 PowerShell 命令")
+    picks_file_full_path = str((out_dir / picks_file_name).resolve()).replace("\\", "\\\\")
 
     html = f"""<!doctype html>
 <html lang="zh-CN">
@@ -220,15 +214,15 @@ def render(out_dir: Path, batch_id: str, anchor_pending_tasks: list) -> Path:
   <pre id="jsonOut"></pre>
 
   <details>
-    <summary>📂 不想自己手动放文件?用下面 PowerShell 一行落盘</summary>
-    <code id="psCmd">{escape(ps_set_cmd)}</code>
-    <p style="margin-top:6px">注意: PowerShell 命令内的 picks 是 placeholder(全选 1)。生成 JSON 后用真实 picks 替换 <code>$json</code> 部分。</p>
+    <summary>📂 不想下载/移动文件?Submit 后用 PowerShell 一行落盘(下方动态生成,含你实际挑选的 picks)</summary>
+    <code id="psCmd" style="display:none">(先点上面「📝 生成 picks JSON」)</code>
   </details>
 </div>
 
 <script>
 const TASKS = {tasks_json};
 const PICKS_FILE = "{escape(picks_file_name)}";
+const PICKS_FILE_FULL_PATH = "{picks_file_full_path}";
 
 const form = document.getElementById('pickForm');
 TASKS.forEach((task) => {{
@@ -321,6 +315,13 @@ document.getElementById('genJson').addEventListener('click', () => {{
   statusEl.textContent = `✅ JSON 已生成 (${{Object.keys(picks).length}} 个 picks)。`;
   statusEl.style.color = '#16a34a';
   window._currentJsonText = jsonText;
+
+  // 动态更新 PowerShell 一行命令(含实际 picks),user 可选复制粘贴到 terminal
+  const psCmd = document.getElementById('psCmd');
+  const psBody = '$json = @\\'\\n' + jsonText + '\\n\\'@ ; Set-Content -LiteralPath \\'' +
+                 PICKS_FILE_FULL_PATH + '\\' -Value $json -Encoding utf8';
+  psCmd.textContent = psBody;
+  psCmd.style.display = 'block';
 }});
 
 downloadBtn.addEventListener('click', () => {{
