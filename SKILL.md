@@ -50,10 +50,14 @@ LLM agent 检测到下列条件命中时启动 skill：
 | **Mode 1: Interactive** (下方 "6 步操作流程") | 用户在对话区给参考图 + 中文 prompt,**让 agent 帮 vision 看图 + rewrite prompt** | Step 1-6 (vision verify → 拆解 → 选角色 → rewrite → image_gen → 归档) | 重(agent 写 prompt) |
 | **Mode 2: Form-driven** (下方 "Batch UX") | 设计师 self-serve,**用户在 HTML 表单里直接写好中文 prompt + 指定图路径**,agent 只做执行器 | 唤起 form → 用户填 → batch_runner 跑 | 轻(agent 不 vision / 不 rewrite) |
 
-**路由决策**:
-- 用户对话区已给完整 prompt + 参考图 → **Mode 1**(走 Step 1-6)
-- 用户说"我要批量出图" / "做几张图"等 **没给具体 prompt** → **Mode 2**(唤起 form)
-- 用户已经在 form 里填好,粘 config.json / 说"跑 batch_xxx" → **Mode 2 触发段**
+**路由决策树**(按顺序判断,**第 1 条命中即停**):
+
+1. 用户已粘 config.json / 说"跑 batch_xxx" / 说"打开批量表单" → **Mode 2 触发段**(执行 batch_runner)
+2. 用户对话区**已给详细中文 prompt + ≥1 张参考图**(任何形态:1 图改文案 / 2+ 图爆款融合 / 多张系列) → **Mode 1**(走 Step 1-6 vision rewriting)
+3. 用户**只说意图、没给详细 prompt**(如"我要生图" / "做几张图" / "出图") → **Mode 2**(唤起 form 让用户 self-serve 填)
+
+**判断标准**:用户话里**有没有可以直接喂给 image model 的中文 prompt 字面**?有 → Mode 1;没有 → Mode 2。
+**反偏见**:不要因为用户话里出现"做几张" / "复刻爆款" / "广告图"等 trigger 词就自动跳 Mode 2——这些词命中 Mode 1 时也常用。
 
 ---
 
@@ -237,11 +241,14 @@ python scripts/image_gen.py \
 - HTTP 200 + meta_json 落盘 + PNG 文件大小 > 0(`/v1/images/edits` 端点不返回 `revised_prompt`)
 - PNG 含 readable Chinese text(不是空白)
 
-**多图（N ≥ 2）调用** — 两条路径，按场景选：
+**多图(N ≥ 2)调用** — 两条路径,**按需求选**(不是哪条都行,语义不同):
 
-**(推荐) 走 Batch UX 段** — HTML 表单触发 + 本 skill 内 `scripts/batch_runner.py`,见本文档后面 "Batch UX (HTML 表单触发模式)" 段。设计师推广路径走这条,agent 也可以直接调(agent 写好 config.json → 调 `python ~/.claude/skills/game-ad-imagegen/scripts/batch_runner.py <config.json>`,runner 调本 skill 的 image_gen.py,多 task / 不同 prompt / 多 n)。
+| 路径 | 多张图之间的关系 | 何时选 | 怎么跑 |
+|---|---|---|---|
+| **简单循环**(默认) | **N 张是同一系列**——同一爆款风格、同一角色池、统一构图调子。每次调用都传**所有用户参考图**,让 image model 根据完整 ref 上下文 + N 段 prompt 自己保系列一致性。 | 用户要"5 张系列广告"、"爆款复刻 N 张"——希望视觉一致 | 循环 N 次 `python scripts/image_gen.py --prompt-file <step4_i.txt> --refs <所有用户参考图都传> --out <i>.png` |
+| **走 Batch UX** | **N 个独立 task**——每个 task 有自己的 prompt + refs + n,task 之间互不影响,同一 task 内 n>1 是该 prompt 的不同 sampling(多样性) | 用户要"跑 3 个不同主题各 2 张"、需要 self-serve 填表、或者要看 result_grid 实时进度 | 走下方 "Mode 2: Batch UX" 段(form 或粘 config.json) |
 
-**(简单循环) agent 自己跑 N 次** — 把 Step 4 写的 N 段 prompt 各自写到临时文件，循环调 `python scripts/image_gen.py --prompt-file ... --refs <所有用户参考图都传> --out <i>.png` N 次。每次传**所有用户参考图**，让 image model 根据 prompt + 参考图上下文自己保系列一致性。简单直接，不需要 anchor strategy。
+⚠️ **关键差异**:简单循环 = 同系列保 N 张一致;Batch UX = 独立 task 矩阵。**不要混用心智模型**——同一 task n>1 不是"系列"(没有共享 anchor 跨调用),想要系列一致请用简单循环。
 
 ---
 
@@ -284,21 +291,26 @@ python scripts/save_outputs.py \
 
 runner 内用 `Path(__file__).resolve().parent` anchor 自动定位本 skill 的 `image_gen.py`(sibling),**不跨 skill 查 B**。
 
-### 入口 — agent 自动开 form(零负担,**任何想用本 skill 出图的请求**都唤起)
+### 入口 — agent 自动开 form (设计师 self-serve 路径)
 
-#### 何时唤起 form
+#### 何时唤起 form (Mode 2)
 
-**user 在对话区说以下任意一种,agent 都唤起 form**(不管 n=1 单图还是 n=N 批量):
+🚨 **路由优先级** (跟顶部"两种执行 Mode 总览"对齐):
 
-| 用户话术(中文/英文,意图任意一种) | agent 行为 |
+**Mode 1 优先**: 用户**已在对话区给详细中文 prompt + ≥1 张参考图**(图作为 attachment 或路径) → 走 Mode 1 vision rewriting,**不要**唤起 form。即使话术命中 Mode 2 trigger 表,只要 prompt 已详细给出,Mode 1 优先。
+
+**Mode 2 触发**: 用户只说**意图、没给详细 prompt** / **明确说要 form / batch** / **要 self-serve 填表**时唤起 form:
+
+| 用户话术 | agent 行为 |
 |---|---|
-| "我要生图" / "做一张图" / "做几张图" / "出图" | 唤起 form |
-| "做一张游戏广告图" / "做几张广告图" / "复刻这张爆款" / "学这张图做几张" | 唤起 form |
-| "我要批量出图" / "打开批量表单" / "开始跑批" | 唤起 form |
-| "用 A skill 出图" / "用 game-ad-imagegen 跑" | 唤起 form |
-| "做张游戏海报" / "出 N 张系列广告" | 唤起 form |
+| "我要批量出图" / "打开批量表单" / "开始跑批" / "跑 batch" | **唤起 form** (明确 form/batch) |
+| "我要生图" / "出图" / "做几张图"(**没给 prompt 也没给图**) | **唤起 form** (无 prompt → self-serve) |
+| "用 A skill 出图" / "用 game-ad-imagegen 跑"(没给细节) | **唤起 form** |
+| "做几张广告图,主题 X,风格 Y"(**给了详细 prompt + 至少一张图**) | **走 Mode 1**,不唤起 form |
+| "复刻这张爆款图(附图),给我们 X 游戏做 5 张系列"(**给了详细 prompt + 图**) | **走 Mode 1**,不唤起 form |
 
 > form 顶部 n 字段默认 = 1(单图模式),user 想批量改 n 即可。**form 既是单图也是批量入口,没有"批量专用 form"。**
+> **决策树**:用户说话里**有没有可以直接喂给 image model 的中文 prompt 字面**?有 → Mode 1;没有(只有意图) → Mode 2。
 
 **agent 不要让 user 自己开 terminal / 自己点 URL**。直接按下面 2 步走:
 
