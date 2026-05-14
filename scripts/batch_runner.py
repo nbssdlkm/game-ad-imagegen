@@ -510,14 +510,14 @@ def main():
         _poll_start = time.time()
         picks = None
         while True:
+            _elapsed = round(time.time() - _poll_start, 0)
             if picks_file.exists():
                 try:
                     picks = json.loads(picks_file.read_text(encoding="utf-8"))
-                    print(f"\n✅ picks received: {picks}", flush=True)
+                    print(f"\n✅ picks received at {int(_elapsed)}s: {picks}", flush=True)
                     break
                 except Exception as e:
-                    print(f"  ! picks JSON 解析失败 (will retry): {e}", file=sys.stderr, flush=True)
-            _elapsed = round(time.time() - _poll_start, 0)
+                    print(f"  ! picks JSON 解析失败 at {int(_elapsed)}s (will retry): {e}", file=sys.stderr, flush=True)
             if _elapsed >= ANCHOR_POLL_TIMEOUT_SEC:
                 print(f"\n⏰ Anchor pick TIMEOUT after {int(_elapsed)}s — abort batch (Phase 3 skipped for {len(anchor_pending_tasks)} task(s))",
                       file=sys.stderr, flush=True)
@@ -530,8 +530,9 @@ def main():
                 )
                 picks = None
                 break
+            # print 用 sleep 前的当前 elapsed(语义最清晰: "已等了 X 秒,timeout Y 秒,下次 check 在 +30s 后")
+            print(f"  ⏳ polling for {picks_file.name} ({int(_elapsed)}s elapsed / timeout {ANCHOR_POLL_TIMEOUT_SEC}s, next check in {ANCHOR_POLL_INTERVAL_SEC}s)...", flush=True)
             time.sleep(ANCHOR_POLL_INTERVAL_SEC)
-            print(f"  ⏳ still polling for {picks_file.name} ({int(_elapsed + ANCHOR_POLL_INTERVAL_SEC)}s elapsed, timeout at {ANCHOR_POLL_TIMEOUT_SEC}s)...", flush=True)
 
         # 如果 timeout 没拿到 picks,跳过 Phase 3 但仍写最终 meta(候选图保留供后续手动 review)
         if picks is None:
