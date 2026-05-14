@@ -344,7 +344,9 @@ def main():
             print(f"\n--- {img_seq}/{n_images_total}  ({task_id} {i}/{n}) ---", flush=True)
             print(f"  refs ({len(refs)}): {[r.name for r in refs]}", flush=True)
             print(f"  size={task_size}, quality={task_quality}", flush=True)
-            print(f"  prompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''}", flush=True)
+            # 打这张图实际喂给 image_gen 的 prompt(N 段不同时各张不一样,方便用户日志里直观看)
+            _this_p = rewritten_prompts[i - 1]
+            print(f"  prompt: {_this_p[:100]}{'...' if len(_this_p) > 100 else ''}", flush=True)
 
             if args.dry_run:
                 preview_cmd = build_cmd(prompt_file, refs, out_path, meta_path, task_size, task_quality)
