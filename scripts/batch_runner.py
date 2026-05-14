@@ -215,8 +215,16 @@ def main():
 
     # ===== 校验阶段（先把所有问题都列出来，不要跑一半才报错）=====
     errors = []
-    for t in tasks:
-        tid = t.get("task_id", "?")
+    seen_task_ids = set()
+    for i, t in enumerate(tasks):
+        tid = t.get("task_id")
+        if not tid or not isinstance(tid, str) or not tid.strip():
+            errors.append(f"tasks[{i}]: 缺少 'task_id' 字段或为空(必填,会被用作 prompt 文件名 / 图片文件名前缀)")
+            continue
+        if tid in seen_task_ids:
+            errors.append(f"tasks[{i}]: task_id '{tid}' 重复(每个 task 必须唯一,否则文件名碰撞)")
+            continue
+        seen_task_ids.add(tid)
         refs = t.get("reference_images") or []
         if not isinstance(refs, list):
             errors.append(f"{tid}: reference_images 必须是 list")
@@ -550,9 +558,14 @@ def main():
             n = int(task.get("n", 1))
             prompt = task["prompt"]
 
-            picked_idx = picks.get(task_id)
-            if not isinstance(picked_idx, int) or picked_idx < 1 or picked_idx > len(candidate_paths):
-                print(f"! [task {task_id}] invalid pick {picked_idx!r}, skipping Phase 3", file=sys.stderr, flush=True)
+            # 容错: picks JSON 可能写 "3" (string) 而不是 3 (int), 尝试转 int
+            picked_idx_raw = picks.get(task_id)
+            try:
+                picked_idx = int(picked_idx_raw) if picked_idx_raw is not None else None
+            except (ValueError, TypeError):
+                picked_idx = None
+            if picked_idx is None or picked_idx < 1 or picked_idx > len(candidate_paths):
+                print(f"! [task {task_id}] invalid pick {picked_idx_raw!r} (need int 1..{len(candidate_paths)}), skipping Phase 3", file=sys.stderr, flush=True)
                 continue
 
             picked_path = candidate_paths[picked_idx - 1]
