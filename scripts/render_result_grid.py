@@ -97,9 +97,20 @@ def _build_task_blocks(out_dir: Path, results: list[dict]) -> str:
     return "\n".join(blocks)
 
 
-_STATUS_LABEL_MAP = {"running": "🟦 进行中", "done": "🟩 完成", "error": "🟥 错误"}
+_STATUS_LABEL_MAP = {
+    "running": "🟦 进行中",
+    "awaiting_picks": "🟨 等选 anchor",
+    "done": "🟩 完成",
+    "error": "🟥 错误",
+}
 _STATUS_HINT_MAP = {
     "running": "<strong>进度页 5 秒后自动刷新看新出的图。</strong>跑批进行中,出一张就更新一张,可以一直开着这页等。",
+    "awaiting_picks": (
+        '<strong style="color:#ffd866">🟨 Phase 1 候选图已生成,等你挑选 anchor 中。</strong><br>'
+        '👉 <a href="anchor_pick.html" style="color:#ffd866;font-weight:bold;text-decoration:underline;font-size:14px">📋 点这里打开 anchor 挑选页 (anchor_pick.html)</a><br>'
+        '挑 1 张作为系列 anchor → 提交后保存 picks JSON 到本目录 (`<batch_id>_anchor_picks.json`),batch_runner 30s 内自动接力跑 Phase 3 series。<br>'
+        '<span style="color:#aaa;font-size:12px">⚠️ 注意:awaiting_picks 状态下本页 5s 仍刷新,但不会有新图出 — 这是等用户操作的暂停态,不是卡死。你挑完 anchor 后 status 才会切回 running 继续出图。</span>'
+    ),
     "done": "全部跑完。喜欢哪几张右键图片「另存为」或直接复制路径。要再跑一批:回对话区,重开 batch_form 配新任务。",
     "error": "跑批有错误。看下面失败 cell 的红色 caption,或对话区 stderr 输出排查。",
 }
@@ -121,8 +132,8 @@ def render(out_dir: Path, batch_meta: dict) -> Path:
     skill_id = batch_meta.get("config", {}).get("skill") or (results[0].get("skill") if results else "a")
     skill_label = "skill A · game-ad-imagegen" if skill_id == "a" else f"skill {skill_id}"
 
-    # 跑批进行中(status=running)加 meta refresh 让浏览器每 5s 自动刷新页面看新出的图
-    auto_refresh = '<meta http-equiv="refresh" content="5">' if status == "running" else ""
+    # 进行中 / 等挑选 anchor 时浏览器每 5s 自动刷新(awaiting_picks 时不会有新图,但 user 写完 picks 后能立刻看到 status 切回 running)
+    auto_refresh = '<meta http-equiv="refresh" content="5">' if status in ("running", "awaiting_picks") else ""
 
     task_blocks = _build_task_blocks(out_dir, results)
 

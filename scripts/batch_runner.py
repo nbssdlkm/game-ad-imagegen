@@ -348,6 +348,18 @@ def main():
         is_anchor = _is_anchor_mode(task)
         M = int(task.get("anchor_candidates", 0)) if is_anchor else 0
 
+        # anchor mode 时把 refs 复制到 out_dir,让 anchor_pick.html 用相对路径能 load ref 缩略图
+        # (否则 user 看到 anchor_pick.html 时 ref 缩略图全 broken,需要手动 copy refs)
+        if is_anchor:
+            import shutil as _shutil
+            for _ref in refs:
+                _ref_dst = out_dir / Path(_ref).name
+                if not _ref_dst.exists():
+                    try:
+                        _shutil.copy(_ref, _ref_dst)
+                    except Exception as _e:
+                        print(f"  ! [task {task_id}] copy ref {_ref.name} → out_dir 失败(继续): {_e}", file=sys.stderr, flush=True)
+
         # === Vision + Rewrite (Mode 2 → 跟 Mode 1 对齐的核心能力) ===
         skip_rewrite = (
             args.no_rewrite
