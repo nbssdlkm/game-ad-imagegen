@@ -48,7 +48,7 @@ LLM agent 检测到下列条件命中时启动 skill：
 | Mode | 何时用 | 流程 | agent 负担 |
 |---|---|---|---|
 | **Mode 1: Interactive** (下方 "6 步操作流程") | 用户在对话区给参考图 + 中文 prompt,**让 agent 帮 vision 看图 + rewrite prompt** | Step 1-6 (vision verify → 拆解 → 选角色 → rewrite → image_gen → 归档) | 重(agent 写 prompt) |
-| **Mode 2: Form-driven** (下方 "Batch UX") | 设计师 self-serve,**用户在 HTML 表单里直接写好中文 prompt + 指定图路径**,agent 只做执行器 | 唤起 form → 用户填 → batch_runner 跑 | 轻(agent 不 vision / 不 rewrite) |
+| **Mode 2: Form-driven** (下方 "Batch UX") | 设计师 self-serve,**用户在 HTML 表单里写中文需求 + 指定图路径**(不需要预先 rewrite),`batch_runner` 自带 vision+rewrite step 跟 Mode 1 对齐 | 唤起 form → 用户填 → batch_runner (vision+rewrite per task) → image_gen | 中(rewrite 由 `scripts/rewrite_prompt.py` 自动跑,agent 不介入) |
 
 **路由决策树**(按顺序判断,**第 1 条命中即停**):
 
@@ -135,14 +135,14 @@ UserIntent:    { 输出张数: N,
 
 ### Step 4: Prompt rewriting(核心,agent 自己写英文 prompt)
 
-把用户的中文需求 + Step 1-3 输出,**改写成 N 段详细英文 prompt**,每段对应 1 张图。所有字段(角色视觉 / StyleSummary / 构图)只从 Step 1 vision call 当次抓取的内容填,**不要从外部翻历史模板或角色 lookup**。
+把用户的中文需求 + Step 1-3 输出,**改写成 N 段详细英文 prompt**,每段对应 1 张图。**N>1 时各段必须不同主体角色**(从 Step 1 CandidatePool 各选一个,系列广告天然多样性),不要写 N 段 minor pose variations of same hero(等于 1 张图重复 N 次)。所有字段(角色视觉 / StyleSummary / 构图)只从 Step 1 vision call 当次抓取的内容填,**不要从外部翻历史模板或角色 lookup**。
 
 **为什么 prompt 字面精度直接决定结果**:`image_gen.py` 切到 `/v1/images/edits` 端点后,**prompt 字面就是 image model 收到的,没有 L2 rewriter 二次改写**。verbatim 中文准确度靠 agent 字面精度,scene complexity 直接决定 image model text 渲染 budget。
 
 #### 必须遵守的原则(case_24 / case_09 / case_04 跨场景验证)
 
 1. **单 hero focus**:1 个主体角色 + ≤2 个副角(inset 头像 / sidekick / 小兵反应)。不要堆 multi-panel 多场景 / 8+ text 位置 → 稀释 image model text 精度(case_24 实证)。
-2. **4-7 个显式 Chinese text 位置**(标题 + 主 CTA + speech bubble + small caption + tag/stamp)。<3 个空虚,>7 个稀释。
+2. **STRICTLY 4-5 个显式 Chinese text 位置**(标题 + 主 promotional banner + 角色 nameplate + speech bubble + 可选 small stamp)。<3 个空虚,**>5 个稀释**(2026-05-14 case_01 batch run 实证 — rewrite 输出 8 个文字位时画面明显拥挤、人物精致度被牺牲;网页版 ChatGPT 输出 6 个则留白合理)。Agent 写 prompt 时**保守裁剪,不确定就砍**。
 3. **每个中文 text 字面 quoted 列出**:写 `Large stylized title at top: "<游戏标题>"`(用实际中文字面,不是 `"the calligraphy title"` 这种英文描述,模型会留空白)。
 4. **每张图独立 labeling**:`Image 1 (<role from PerImageNotes>): <key_visuals>. Image 2 (<role>): ...` 每张图独立角色,**不要 collapse 成 "Image A primary style / Image B/C source" 二分**(case_15 形态偏见,对单图修改 / 多实机图 / 风格融合 有害)。
 5. **70% faithful 30% creative 显式写**:`Keep about 70% faithful to reference style, 30% creative variation`。
