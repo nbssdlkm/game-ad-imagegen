@@ -132,7 +132,7 @@ def _strip_fence(text: str) -> str:
     return text
 
 
-def rewrite(user_prompt: str, reference_images, n: int = 1, model: str = None, verbose: bool = False) -> list:
+def rewrite(user_prompt: str, reference_images, n: int = 1, model: str = None, verbose: bool = False, anchor_phase: str = None) -> list:
     """vision + rewrite。返回 list[str] of length n。
 
     输入:
@@ -141,6 +141,14 @@ def rewrite(user_prompt: str, reference_images, n: int = 1, model: str = None, v
       n: 期望输出几段独立 prompt(每段对应 1 张图)
       model: 覆盖默认 LM model
       verbose: 打印元信息
+      anchor_phase: None (默认,标准 multi-segment mode)
+                    "phase1" (anchor workflow Phase 1: 出 M 候选给用户挑;
+                              系统层面等同 n=1 标准 rewrite,但 batch_runner 会用这同一段
+                              prompt 跑 M 次 sampling 出 M 张候选)
+                    "phase3" (anchor workflow Phase 3: reference_images 列表**最后一张**
+                              是用户在 Phase 2 挑选的 anchor png,LLM 必须严格锁定 anchor
+                              的画风/UI/调色/字体作为系列锚,N-1 段 prompt 每段不同主体角色
+                              但视觉风格 ~85% faithful to anchor)
 
     返回:
       list[str]:
@@ -152,6 +160,7 @@ def rewrite(user_prompt: str, reference_images, n: int = 1, model: str = None, v
       - 一次 LLM 调用产 N 段(省 vision token)
       - 系列多样性:每段尽量不同角色(rule 5)
       - text 位置严约束:≤5 个/段(rule 2)
+      - anchor_phase="phase3" 时强制锁 anchor 风格,避免 N 张系列画风漂
     """
     if n < 1:
         raise ValueError(f"n must be >= 1, got {n}")
@@ -176,6 +185,32 @@ def rewrite(user_prompt: str, reference_images, n: int = 1, model: str = None, v
         )
     else:
         user_text += f"\n\n[runner instruction] Produce 1 prompt (single output image)."
+
+    # Anchor workflow Phase 3: 最后一张 ref 是用户挑选的 anchor,锁视觉风格
+    if anchor_phase == "phase3" and len(ref_paths) >= 1:
+        anchor_idx = len(ref_paths)
+        user_text += (
+            f"\n\n[ANCHOR LOCK MODE — Phase 3] Image {anchor_idx} (the LAST reference image) is the "
+            f"user-picked **anchor image** from a Phase 1 candidate round. It represents the LOCKED "
+            f"visual style for this entire series — rendering technique, color palette, lighting, UI "
+            f"layout, typography, composition language. Your {n} prompts MUST visually echo Image "
+            f"{anchor_idx}'s style very tightly (**~85% faithful to anchor instead of the usual 70%**) "
+            f"— only the primary character identity / pose / sidekick may vary across prompts. "
+            f"Images 1..{anchor_idx-1} provide character source material as before. "
+            f"In each prompt, **explicitly write** at the end: "
+            f"`Strictly match Image {anchor_idx}'s rendering style, palette, UI plate styling, and typography.` "
+            f"The final output series (picked anchor + {n} new images) should look like one coherent "
+            f"set, not {n+1} unrelated images."
+        )
+    elif anchor_phase == "phase1":
+        # Phase 1 = 出 M 候选给用户挑;让 LLM 写一段标准 prompt (single hero),
+        # batch_runner 用同段 prompt 跑 M 次 sampling 自然出 M 张候选(细节不同)
+        user_text += (
+            f"\n\n[ANCHOR CANDIDATE MODE — Phase 1] This prompt will be used to generate M candidate "
+            f"variants (same prompt × M sampling), letting the user pick the best one as anchor for "
+            f"a subsequent Phase 3 series. Write a single well-crafted prompt with concrete character "
+            f"choice (don't artificially leave it vague — sampling will provide pose/detail variety)."
+        )
 
     user_content = image_contents + [{"type": "text", "text": user_text}]
 
@@ -222,6 +257,8 @@ def main():
     ap.add_argument("--out", required=True, help="输出文件(N 段用 `---PROMPT-SEP---` 分隔)")
     ap.add_argument("--n", type=int, default=1, help="期望输出几段独立 prompt(默认 1)")
     ap.add_argument("--model", default=None, help=f"override LM model (default: {DEFAULT_LM_MODEL})")
+    ap.add_argument("--anchor-phase", default=None, choices=[None, "phase1", "phase3"],
+                    help="anchor workflow mode: phase1 (候选生成) / phase3 (anchor 锁风格,refs 最后一张是 picked anchor)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -233,7 +270,7 @@ def main():
             return 2
 
     try:
-        prompts = rewrite(user_prompt, refs, n=args.n, model=args.model, verbose=args.verbose)
+        prompts = rewrite(user_prompt, refs, n=args.n, model=args.model, verbose=args.verbose, anchor_phase=args.anchor_phase)
     except Exception as e:
         print(f"! rewrite failed: {type(e).__name__}: {e}", file=sys.stderr)
         return 1

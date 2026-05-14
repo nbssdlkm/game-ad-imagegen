@@ -244,8 +244,25 @@ def main():
         return 2
 
     # ===== 跑批 =====
-    n_images_total = sum(t.get("n", 1) for t in tasks)
-    print(f"=== batch {batch_id} [skill=a · game-ad-imagegen]: {len(tasks)} 任务 × n = {n_images_total} 张图 ===", flush=True)
+    # Anchor workflow (anchor_candidates >= 2 + n >= 2 时启用):
+    #   Phase 1: 跑 M 张候选(同段 prompt × M sampling),user 挑 1 张
+    #   Phase 2: poll {batch_id}_anchor_picks.json
+    #   Phase 3: picked anchor → t01.png + rewrite N-1 段 with picked anchor in refs → 跑 N-1 张
+    # 单 task 总图数 = M (candidates) + (n-1) (series w/o picked anchor 那张,copied not generated)
+    def _is_anchor_mode(t):
+        M = int(t.get("anchor_candidates", 0))
+        return M >= 2 and int(t.get("n", 1)) >= 2
+
+    def _task_image_count(t):
+        n = int(t.get("n", 1))
+        if _is_anchor_mode(t):
+            return int(t["anchor_candidates"]) + (n - 1)
+        return n
+
+    n_images_total = sum(_task_image_count(t) for t in tasks)
+    n_anchor_tasks = sum(1 for t in tasks if _is_anchor_mode(t))
+    anchor_summary = f", {n_anchor_tasks} task(s) in anchor mode" if n_anchor_tasks > 0 else ""
+    print(f"=== batch {batch_id} [skill=a · game-ad-imagegen]: {len(tasks)} 任务 × ~ = {n_images_total} 张图{anchor_summary} ===", flush=True)
     print(f"  image_gen.py: {IMAGE_GEN_PY}", flush=True)
     print(f"  out_dir: {out_dir}", flush=True)
     print(f"  defaults: size={batch_size}, quality={batch_quality}", flush=True)
@@ -290,6 +307,9 @@ def main():
         _write_incremental_progress([], n_images_total, status="running")
         print(f"  📊 进度页已就绪: {out_dir / 'result_grid.html'}\n", flush=True)
 
+    # Anchor mode 累积:Phase 1 跑完后等 user 挑选,Phase 3 再继续
+    anchor_pending_tasks = []
+
     for t_idx, task in enumerate(tasks, 1):
         task_id = task["task_id"]
         refs = [Path(p) for p in task["reference_images"]]
@@ -297,93 +317,298 @@ def main():
         n = int(task.get("n", 1))
         task_size = task.get("size") or batch_size
         task_quality = task.get("quality") or batch_quality
+        is_anchor = _is_anchor_mode(task)
+        M = int(task.get("anchor_candidates", 0)) if is_anchor else 0
 
         # === Vision + Rewrite (Mode 2 → 跟 Mode 1 对齐的核心能力) ===
-        # 默认把用户中文需求 rewrite 成详细英文 image-gen prompt(T9 模板),
-        # 让 Mode 2 (form / 跑批) 也享受 skill 的核心 rewrite 能力。
-        # 跳过条件:
-        #   - CLI --no-rewrite flag (向后兼容)
-        #   - cfg.prompt_already_rewritten == true (全批跳过)
-        #   - task.prompt_already_rewritten == true (单 task 跳过)
         skip_rewrite = (
             args.no_rewrite
             or cfg.get("prompt_already_rewritten")
             or task.get("prompt_already_rewritten")
         )
 
-        if skip_rewrite or args.dry_run:
-            rewritten_prompts = [prompt] * n
-            if skip_rewrite and not args.dry_run:
-                print(f"\n[task {task_id}] skip rewrite (prompt_already_rewritten / --no-rewrite), reusing original × {n}", flush=True)
-        else:
-            print(f"\n[task {task_id}] vision + rewrite step ({len(refs)} refs, n={n})...", flush=True)
-            try:
-                sys.path.insert(0, str(Path(__file__).parent))
-                from rewrite_prompt import rewrite as _do_rewrite
-                rewritten_prompts = _do_rewrite(prompt, refs, n=n)
-                # 存原始中文 prompt 作 debug trail
-                (out_dir / f"{task_id}_prompt_original.txt").write_text(prompt, encoding="utf-8")
-                total_chars = sum(len(p) for p in rewritten_prompts)
-                print(f"[task {task_id}] rewrite done ({len(rewritten_prompts)} prompts, {total_chars} chars total)", flush=True)
-            except Exception as e:
-                print(f"! [task {task_id}] rewrite failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-                print(f"  falling back to original prompt × {n} — image quality may suffer", file=sys.stderr, flush=True)
-                rewritten_prompts = [prompt] * n
-
-        # 兜底:确保 len == n(rewrite 内部应已保证,这里 belt-and-suspenders)
-        while len(rewritten_prompts) < n:
-            rewritten_prompts.append(rewritten_prompts[-1])
-
-        for i in range(1, n + 1):
-            img_seq += 1
-            # 每张图独立 prompt_file(对应这次 sampling 的那段 rewrite，N 段不同角色多样性)
-            prompt_file = out_dir / f"{task_id}_{i:02d}_prompt.txt"
-            prompt_file.write_text(rewritten_prompts[i - 1], encoding="utf-8")
-            out_path = out_dir / f"{task_id}_{i:02d}.png"
-            meta_path = out_dir / f"{task_id}_{i:02d}_meta.json"
-            print(f"\n--- {img_seq}/{n_images_total}  ({task_id} {i}/{n}) ---", flush=True)
-            print(f"  refs ({len(refs)}): {[r.name for r in refs]}", flush=True)
-            print(f"  size={task_size}, quality={task_quality}", flush=True)
-            # 打这张图实际喂给 image_gen 的 prompt(N 段不同时各张不一样,方便用户日志里直观看)
-            _this_p = rewritten_prompts[i - 1]
-            print(f"  prompt: {_this_p[:100]}{'...' if len(_this_p) > 100 else ''}", flush=True)
-
-            if args.dry_run:
-                preview_cmd = build_cmd(prompt_file, refs, out_path, meta_path, task_size, task_quality)
-                print(f"  $ [dry-run] {' '.join(str(c) for c in preview_cmd[:6])}{' ...' if len(preview_cmd) > 6 else ''}", flush=True)
-                res = {
-                    "out_path": str(out_path),
-                    "http_status": 200,
-                    "elapsed_sec": 0.0,
-                    "_dry_run": True,
-                }
+        if is_anchor:
+            # ==========================================================
+            # === Anchor mode Phase 1: 同段 prompt × M 次 sampling 出候选 ===
+            # ==========================================================
+            if skip_rewrite or args.dry_run:
+                cand_prompt = prompt
+                if skip_rewrite and not args.dry_run:
+                    print(f"\n[task {task_id}] (anchor Phase 1) skip rewrite, reusing original", flush=True)
             else:
-                # 防御:即使 run_one 内部还有 raise(理论上不该,但万一)也接住
+                print(f"\n[task {task_id}] (anchor Phase 1) vision + rewrite ({len(refs)} refs, M={M} candidates)...", flush=True)
                 try:
-                    res = run_one(prompt_file, refs, out_path, meta_path, task_size, task_quality)
+                    sys.path.insert(0, str(Path(__file__).parent))
+                    from rewrite_prompt import rewrite as _do_rewrite
+                    _cand_prompts = _do_rewrite(prompt, refs, n=1, anchor_phase="phase1")
+                    cand_prompt = _cand_prompts[0]
+                    (out_dir / f"{task_id}_prompt_original.txt").write_text(prompt, encoding="utf-8")
+                    print(f"[task {task_id}] Phase 1 rewrite done ({len(cand_prompt)} chars)", flush=True)
                 except Exception as e:
-                    import traceback as _tb2
-                    print(f"\n    ! run_one 内异常(catch + 继续下一张): {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-                    res = {
-                        "out_path": str(out_path),
-                        "http_status": None,
-                        "elapsed_sec": 0.0,
-                        "error": f"run_one raised: {type(e).__name__}: {e}\n{_tb2.format_exc()[-1500:]}",
-                    }
-            res.update({
+                    print(f"! [task {task_id}] Phase 1 rewrite failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+                    cand_prompt = prompt
+
+            cand_prompt_file = out_dir / f"{task_id}_anchor_cand_prompt.txt"
+            cand_prompt_file.write_text(cand_prompt, encoding="utf-8")
+
+            candidate_paths = []
+            for ci in range(1, M + 1):
+                img_seq += 1
+                cand_out = out_dir / f"{task_id}_anchor_cand_{ci:02d}.png"
+                cand_meta = out_dir / f"{task_id}_anchor_cand_{ci:02d}_meta.json"
+                candidate_paths.append(cand_out)
+
+                print(f"\n--- {img_seq}/{n_images_total}  ({task_id} anchor cand {ci}/{M}) ---", flush=True)
+                print(f"  refs ({len(refs)}): {[r.name for r in refs]}", flush=True)
+                print(f"  size={task_size}, quality={task_quality}", flush=True)
+                print(f"  prompt: {cand_prompt[:100]}{'...' if len(cand_prompt) > 100 else ''}", flush=True)
+
+                if args.dry_run:
+                    preview_cmd = build_cmd(cand_prompt_file, refs, cand_out, cand_meta, task_size, task_quality)
+                    print(f"  $ [dry-run] {' '.join(str(c) for c in preview_cmd[:6])} ...", flush=True)
+                    res = {"out_path": str(cand_out), "http_status": 200, "elapsed_sec": 0.0, "_dry_run": True}
+                else:
+                    try:
+                        res = run_one(cand_prompt_file, refs, cand_out, cand_meta, task_size, task_quality)
+                    except Exception as e:
+                        import traceback as _tb2
+                        print(f"\n    ! run_one(anchor cand) 异常: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+                        res = {"out_path": str(cand_out), "http_status": None, "elapsed_sec": 0.0,
+                               "error": f"run_one raised: {type(e).__name__}: {e}\n{_tb2.format_exc()[-1500:]}"}
+                res.update({
+                    "task_id": task_id,
+                    "skill": THIS_SKILL_ID,
+                    "task_seq_in_batch": t_idx,
+                    "image_seq_in_task": -ci,  # 负数 = anchor candidate
+                    "is_anchor_candidate": True,
+                    "anchor_candidate_idx": ci,
+                    "reference_images": [str(r) for r in refs],
+                    "prompt": prompt,
+                    "size": task_size,
+                    "quality": task_quality,
+                })
+                all_results.append(res)
+                if not args.dry_run:
+                    _write_incremental_progress(all_results, n_images_total, status="running")
+
+            # Stash 给后面 Phase 2+3 用
+            anchor_pending_tasks.append({
+                "t_idx": t_idx,
+                "task": task,
+                "refs": refs,
+                "candidate_paths": candidate_paths,
+                "task_size": task_size,
+                "task_quality": task_quality,
+            })
+
+        else:
+            # ==========================================================
+            # === Standard mode: 沿用 N 段不同主体 prompt 流程 ===
+            # ==========================================================
+            if skip_rewrite or args.dry_run:
+                rewritten_prompts = [prompt] * n
+                if skip_rewrite and not args.dry_run:
+                    print(f"\n[task {task_id}] skip rewrite (prompt_already_rewritten / --no-rewrite), reusing original × {n}", flush=True)
+            else:
+                print(f"\n[task {task_id}] vision + rewrite step ({len(refs)} refs, n={n})...", flush=True)
+                try:
+                    sys.path.insert(0, str(Path(__file__).parent))
+                    from rewrite_prompt import rewrite as _do_rewrite
+                    rewritten_prompts = _do_rewrite(prompt, refs, n=n)
+                    (out_dir / f"{task_id}_prompt_original.txt").write_text(prompt, encoding="utf-8")
+                    total_chars = sum(len(p) for p in rewritten_prompts)
+                    print(f"[task {task_id}] rewrite done ({len(rewritten_prompts)} prompts, {total_chars} chars total)", flush=True)
+                except Exception as e:
+                    print(f"! [task {task_id}] rewrite failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+                    print(f"  falling back to original prompt × {n} — image quality may suffer", file=sys.stderr, flush=True)
+                    rewritten_prompts = [prompt] * n
+
+            while len(rewritten_prompts) < n:
+                rewritten_prompts.append(rewritten_prompts[-1])
+
+            for i in range(1, n + 1):
+                img_seq += 1
+                prompt_file = out_dir / f"{task_id}_{i:02d}_prompt.txt"
+                prompt_file.write_text(rewritten_prompts[i - 1], encoding="utf-8")
+                out_path = out_dir / f"{task_id}_{i:02d}.png"
+                meta_path = out_dir / f"{task_id}_{i:02d}_meta.json"
+                print(f"\n--- {img_seq}/{n_images_total}  ({task_id} {i}/{n}) ---", flush=True)
+                print(f"  refs ({len(refs)}): {[r.name for r in refs]}", flush=True)
+                print(f"  size={task_size}, quality={task_quality}", flush=True)
+                _this_p = rewritten_prompts[i - 1]
+                print(f"  prompt: {_this_p[:100]}{'...' if len(_this_p) > 100 else ''}", flush=True)
+
+                if args.dry_run:
+                    preview_cmd = build_cmd(prompt_file, refs, out_path, meta_path, task_size, task_quality)
+                    print(f"  $ [dry-run] {' '.join(str(c) for c in preview_cmd[:6])} ...", flush=True)
+                    res = {"out_path": str(out_path), "http_status": 200, "elapsed_sec": 0.0, "_dry_run": True}
+                else:
+                    try:
+                        res = run_one(prompt_file, refs, out_path, meta_path, task_size, task_quality)
+                    except Exception as e:
+                        import traceback as _tb2
+                        print(f"\n    ! run_one 内异常(catch + 继续下一张): {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+                        res = {"out_path": str(out_path), "http_status": None, "elapsed_sec": 0.0,
+                               "error": f"run_one raised: {type(e).__name__}: {e}\n{_tb2.format_exc()[-1500:]}"}
+                res.update({
+                    "task_id": task_id,
+                    "skill": THIS_SKILL_ID,
+                    "task_seq_in_batch": t_idx,
+                    "image_seq_in_task": i,
+                    "reference_images": [str(r) for r in refs],
+                    "prompt": prompt,
+                    "size": task_size,
+                    "quality": task_quality,
+                })
+                all_results.append(res)
+                if not args.dry_run:
+                    _write_incremental_progress(all_results, n_images_total, status="running")
+
+    # ==========================================================
+    # === Anchor mode Phase 2: render anchor_pick.html + poll picks JSON ===
+    # === Anchor mode Phase 3: 跑 N-1 张 series with anchor 锁风格 ===
+    # ==========================================================
+    if anchor_pending_tasks and not args.dry_run:
+        # 渲染 anchor_pick.html (默认 UI;技术团队可自行替换)
+        try:
+            sys.path.insert(0, str(Path(__file__).parent))
+            from render_anchor_pick import render as _render_pick
+            pick_html = _render_pick(out_dir, batch_id, anchor_pending_tasks)
+            print(f"\n📋 anchor_pick.html ready: {pick_html}", flush=True)
+        except Exception as e:
+            print(f"! 渲染 anchor_pick.html 失败(继续 poll JSON 文件): {e}", file=sys.stderr, flush=True)
+
+        picks_file = out_dir / f"{batch_id}_anchor_picks.json"
+        ready_file = out_dir / f"{batch_id}_anchor_pick_ready.txt"
+        ready_msg_lines = [
+            f"Phase 1 done at {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Anchor candidates ready for {len(anchor_pending_tasks)} task(s).",
+            "",
+            f"NEXT: open anchor_pick.html in browser to pick anchor for each task,",
+            f"   submit → save the JSON output to: {picks_file}",
+            "",
+            "OR write JSON manually with this schema:",
+            "{",
+        ]
+        for ap in anchor_pending_tasks:
+            tid = ap["task"]["task_id"]
+            M_ = int(ap["task"]["anchor_candidates"])
+            ready_msg_lines.append(f'  "{tid}": <1..{M_}>,')
+        ready_msg_lines.extend(["}", ""])
+        ready_file.write_text("\n".join(ready_msg_lines), encoding="utf-8")
+
+        print(f"\n⏸️ Phase 1 done — waiting for anchor picks", flush=True)
+        print(f"   1. Open: {out_dir / 'anchor_pick.html'}", flush=True)
+        print(f"   2. Pick one anchor per task → save JSON to: {picks_file.name}", flush=True)
+        print(f"   batch_runner polls every 30s...\n", flush=True)
+
+        # Poll loop
+        _poll_start = time.time()
+        while True:
+            if picks_file.exists():
+                try:
+                    picks = json.loads(picks_file.read_text(encoding="utf-8"))
+                    print(f"\n✅ picks received: {picks}", flush=True)
+                    break
+                except Exception as e:
+                    print(f"  ! picks JSON 解析失败 (will retry): {e}", file=sys.stderr, flush=True)
+            time.sleep(30)
+            _elapsed = round(time.time() - _poll_start, 0)
+            print(f"  ⏳ still polling for {picks_file.name} ({int(_elapsed)}s elapsed)...", flush=True)
+
+        # Phase 3: 对每个 anchor task 跑 N-1 张 series
+        for pending in anchor_pending_tasks:
+            task = pending["task"]
+            t_idx = pending["t_idx"]
+            task_id = task["task_id"]
+            refs = pending["refs"]
+            candidate_paths = pending["candidate_paths"]
+            task_size = pending["task_size"]
+            task_quality = pending["task_quality"]
+            n = int(task.get("n", 1))
+            prompt = task["prompt"]
+
+            picked_idx = picks.get(task_id)
+            if not isinstance(picked_idx, int) or picked_idx < 1 or picked_idx > len(candidate_paths):
+                print(f"! [task {task_id}] invalid pick {picked_idx!r}, skipping Phase 3", file=sys.stderr, flush=True)
+                continue
+
+            picked_path = candidate_paths[picked_idx - 1]
+            if not picked_path.exists():
+                print(f"! [task {task_id}] picked candidate {picked_path} not found", file=sys.stderr, flush=True)
+                continue
+
+            # 复制 picked candidate → t0X_01.png (第 1 张正式输出)
+            import shutil as _shutil
+            first_out = out_dir / f"{task_id}_01.png"
+            _shutil.copy(picked_path, first_out)
+            img_seq += 1
+            print(f"\n[task {task_id}] Phase 3: picked cand {picked_idx} → {first_out.name}", flush=True)
+            all_results.append({
+                "out_path": str(first_out),
+                "http_status": 200,
+                "elapsed_sec": 0.0,
+                "is_anchor_picked": True,
+                "anchor_candidate_source": picked_idx,
                 "task_id": task_id,
                 "skill": THIS_SKILL_ID,
                 "task_seq_in_batch": t_idx,
-                "image_seq_in_task": i,
+                "image_seq_in_task": 1,
                 "reference_images": [str(r) for r in refs],
                 "prompt": prompt,
                 "size": task_size,
                 "quality": task_quality,
             })
-            all_results.append(res)
+            _write_incremental_progress(all_results, n_images_total, status="running")
 
-            # 增量写进度: 每张图跑完就更新 _batch_meta.json + result_grid.html
-            if not args.dry_run:
+            # Rewrite N-1 段 with anchor_phase="phase3"
+            new_refs = list(refs) + [picked_path]
+            try:
+                sys.path.insert(0, str(Path(__file__).parent))
+                from rewrite_prompt import rewrite as _do_rewrite
+                series_prompts = _do_rewrite(prompt, new_refs, n=n - 1, anchor_phase="phase3")
+                total_chars = sum(len(p) for p in series_prompts)
+                print(f"[task {task_id}] Phase 3 rewrite done ({len(series_prompts)} prompts, {total_chars} chars, anchor-locked)", flush=True)
+            except Exception as e:
+                print(f"! [task {task_id}] Phase 3 rewrite failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+                series_prompts = [prompt] * (n - 1)
+
+            while len(series_prompts) < n - 1:
+                series_prompts.append(series_prompts[-1])
+
+            # 跑 N-1 张 series with picked anchor 在 refs 列表末尾
+            for i in range(2, n + 1):
+                img_seq += 1
+                prompt_for_this = series_prompts[i - 2]
+                prompt_file = out_dir / f"{task_id}_{i:02d}_prompt.txt"
+                prompt_file.write_text(prompt_for_this, encoding="utf-8")
+                out_path = out_dir / f"{task_id}_{i:02d}.png"
+                meta_path = out_dir / f"{task_id}_{i:02d}_meta.json"
+                print(f"\n--- {img_seq}/{n_images_total}  ({task_id} Phase 3 series {i}/{n}) ---", flush=True)
+                print(f"  refs ({len(new_refs)}): {[r.name for r in new_refs]}", flush=True)
+                print(f"  size={task_size}, quality={task_quality}", flush=True)
+                print(f"  prompt: {prompt_for_this[:100]}{'...' if len(prompt_for_this) > 100 else ''}", flush=True)
+
+                try:
+                    res = run_one(prompt_file, new_refs, out_path, meta_path, task_size, task_quality)
+                except Exception as e:
+                    import traceback as _tb2
+                    print(f"\n    ! run_one(Phase 3 series) 异常: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+                    res = {"out_path": str(out_path), "http_status": None, "elapsed_sec": 0.0,
+                           "error": f"run_one raised: {type(e).__name__}: {e}\n{_tb2.format_exc()[-1500:]}"}
+                res.update({
+                    "task_id": task_id,
+                    "skill": THIS_SKILL_ID,
+                    "task_seq_in_batch": t_idx,
+                    "image_seq_in_task": i,
+                    "is_anchor_series": True,
+                    "anchor_image_used": str(picked_path),
+                    "reference_images": [str(r) for r in new_refs],
+                    "prompt": prompt,
+                    "size": task_size,
+                    "quality": task_quality,
+                })
+                all_results.append(res)
                 _write_incremental_progress(all_results, n_images_total, status="running")
 
     # 最终收尾(status="done")
