@@ -82,18 +82,22 @@ _ensure_scripts_in_syspath()
 
 def build_cmd(prompt_file: Path, refs: list[Path],
               out_path: Path, meta_path: Path, size: str, quality: str) -> list[str]:
-    """构造 A 的 image_gen.py CLI。A 必须 ≥1 张图（校验阶段已保证）。"""
-    refs_arg = ",".join(str(r) for r in refs)
-    return [
+    """构造 A 的 image_gen.py CLI。
+    refs 空 → 不传 --refs,image_gen.py 自动切到 0 图 text2im 模式(/v1/images/generations);
+    refs ≥1 张 → 传 --refs,走 /v1/images/edits。
+    """
+    cmd = [
         sys.executable, "-u", str(IMAGE_GEN_PY),
         "--prompt-file", str(prompt_file),
-        "--refs", refs_arg,
         "--out", str(out_path),
         "--meta-out", str(meta_path),
         "--size", size,
         "--quality", quality,
         "--no-invariants",
     ]
+    if refs:
+        cmd.extend(["--refs", ",".join(str(r) for r in refs)])
+    return cmd
 
 
 def run_one(prompt_file: Path, refs: list[Path],
@@ -235,13 +239,8 @@ def main():
         if not isinstance(refs, list):
             errors.append(f"{tid}: reference_images 必须是 list")
             continue
-        # A skill 必须 ≥1 张图(走 /v1/images/edits),不支持纯文字生图
-        if len(refs) == 0:
-            errors.append(
-                f"{tid}: A skill 不支持纯文字生图(0 图)。"
-                f"请加至少 1 张图,或切到 B skill (codex-imagegen-fork) 跑这个 task"
-            )
-            continue
+        # A skill 支持 0 图 text2im(走 /v1/images/generations,游戏广告纯文字生买量素材)
+        # 和 ≥1 图 edit / composite(走 /v1/images/edits)。anchor mode 仍需 ≥1 图(下方校验)
         for p in refs:
             if not Path(p).exists():
                 errors.append(f"{tid}: 参考图不存在 — {p}")

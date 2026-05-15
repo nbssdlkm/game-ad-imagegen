@@ -14,7 +14,7 @@
 <header>
   <h1>批量出图配置 <span class="skill-badge skill-a">skill A · game-ad-imagegen</span></h1>
   <p class="hint">填好后点底部「生成跑批指令」,会下载一个 JSON + 复制到剪贴板,回对话区说<code>跑 batch_&lt;时间戳&gt;</code> 或直接粘贴 JSON 就开跑。</p>
-  <p class="hint" style="margin-top:6px;color:#996c1a">⚠️ 本表单专属 A skill (<code>game-ad-imagegen</code>),生成的 config.json 自带 <code>skill: "a"</code> 字段。<strong>每个任务必须 ≥ 1 张参考图</strong>(不支持纯文字生图)。要纯文字生图请改用 B skill 的 batch_form。</p>
+  <p class="hint" style="margin-top:6px;color:#996c1a">⚠️ 本表单专属 A skill (<code>game-ad-imagegen</code>),生成的 config.json 自带 <code>skill: "a"</code> 字段。<strong>支持 0 图(纯文字生买量素材)和 ≥1 图(参考图 edit / 多图融合)</strong>。0 图走 <code>/v1/images/generations</code>,有图走 <code>/v1/images/edits</code>。注意 anchor 模式必需 ≥1 图(0 图 text2im 不支持 anchor)。</p>
 </header>
 
 <section class="global">
@@ -81,9 +81,9 @@
       <button type="button" class="btn-del">删除</button>
     </div>
     <div class="row">
-      <label>图片（每行一条，1-N 张）</label>
-      <textarea class="reference_images" rows="4" placeholder="每行一条图片路径(必须 ≥1 张)。例如:&#10;D:/我的素材/参考图1.png&#10;D:/我的素材/参考图2.png"></textarea>
-      <span class="hint inline" style="margin-top:4px">顺序按你 prompt 里"图1/图2/图3"对应的来 — 每张图的角色(参考/素材/叠加)写在 prompt 里。</span>
+      <label>图片（每行一条，0-N 张）</label>
+      <textarea class="reference_images" rows="4" placeholder="留空 = 0 图纯文字生买量素材(text2im)&#10;或贴路径,例如:&#10;D:/我的素材/参考图1.png&#10;D:/我的素材/参考图2.png"></textarea>
+      <span class="hint inline" style="margin-top:4px">0 图 = 纯文字生买量素材(走 generations 端点);≥1 图 = edit / 多图融合(走 edits 端点)。顺序按 prompt 里"图1/图2/..."对应。<strong>anchor 模式需要 ≥1 图</strong>。</span>
     </div>
     <div class="row">
       <label>中文需求 prompt</label>

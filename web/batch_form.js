@@ -109,8 +109,9 @@ function validateConfig(cfg) {
     const label = `任务 ${t.task_id}`;
     if (!t.prompt) errs.push(`${label}:中文 prompt 不能空`);
     if (t.n < 1 || t.n > 10) errs.push(`${label}:出图数应在 1-10`);
-    if (t.reference_images.length === 0) {
-      errs.push(`${label}:A skill 不支持纯文字生图(0 图),请加至少 1 张图,或改用 B skill 的 batch_form`);
+    // A skill 现支持 0 图(text2im 买量素材) + ≥1 图(edit)。anchor mode 仍需 ≥1 图。
+    if (t.reference_images.length === 0 && t.anchor_candidates) {
+      errs.push(`${label}:anchor 模式需要 ≥1 张参考图(0 图 text2im 不支持 anchor 流程)。删 anchor 字段或加图`);
     }
   });
   return errs;

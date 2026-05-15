@@ -3,7 +3,7 @@ name: game-ad-imagegen
 description: |
   生成**游戏买量广告图 / 海报 / 买量素材**(特化场景)。当用户提供「爆款参考图 + 实机图 + 中文 prompt」请你做 N 张游戏广告系列图时使用。
   模拟网页版 ChatGPT 的"对话模型 → image_gen.text2im"工作流,按 6 步流程产出 N 张高质量横版广告图(默认 1536x1024 = gpt-image-2 合法 landscape)。
-  题材无关 / 角色无关:所有视觉特征由 vision call 从用户提供的参考图与实机图自动识别,skill 本体不预设任何题材或角色。**必须 ≥1 张参考图**(0 图纯文字生图请走 codex-imagegen-fork)。
+  题材无关 / 角色无关:所有视觉特征由 vision call 从用户提供的参考图与实机图自动识别,skill 本体不预设任何题材或角色。**支持 0 图(纯文字生买量素材,text2im)和 ≥1 图(edit / 多图融合)**;0 图走 `/v1/images/generations`,有图走 `/v1/images/edits`。非游戏广告题材(通用任意题材)请走 codex-imagegen-fork。
   **跟 `codex-imagegen-fork` (B skill) 的差异化**:A 专做游戏买量广告(爆款复刻 + 多张系列 + 6 步 vision 工作流);B 做通用图片任务(单图修改 / 0 图文生图 / 任意题材)。设计师如果是"复刻爆款 + 出 N 张系列广告图"走 A;如果是"通用修图 / PS 一下 / 纯文字生一张"走 B。
   触发词:复刻这张爆款图给我们游戏 / 做几张游戏广告图 / 学这张图做几张类似的 / 游戏海报生成 / 买量素材 / 任意题材的游戏广告图复刻 / 出 N 张系列广告图。
 ---
@@ -49,7 +49,7 @@ LLM agent 检测到下列条件命中时启动 skill：
 
 **支持的形态**（28 raw case 验证）：1 张图改文案 / 2 张爆款风格融合 / 3 张含 UI+文字+角色头像迁移 / 5+ 张实机图自由组合 — 都走 A skill；图的角色（参考 / 素材 / 叠加目标）由用户 prompt 描述 + vision 实际识别决定。
 
-**不命中场景**：**0 张图的纯文字生图**（text2im）→ 让 B skill `codex-imagegen-fork` 接管（B 的 `generate` 子命令支持 text2im，A 走 `/v1/images/edits` 必须 ≥1 图）。
+**0 图模式**：用户给 0 张参考图 + 纯文字描述游戏买量素材（如"做一张三国主题游戏 banner，主标题立即下载"），A 走 `/v1/images/generations` 端点（text2im），仍走 rewrite_prompt + invariant 双闸。Anchor mode 不支持 0 图（vision verify 需要图）。**非游戏广告题材**（产品照 / 企业 logo / 真实摄影 / infographic 等通用任意题材）→ B skill `codex-imagegen-fork`，那边的 system prompt 是 generic taxonomy 不会强加买量风格。
 
 ## 必读约束（QUALITY INVARIANTS）
 
@@ -455,7 +455,7 @@ batch UX **不预设图片角色**——`reference_images` 就是一个有序列
 
 ### A skill 不支持（明确 reject）
 
-- **0 张图（纯文字生图 text2im）**：A 走 `/v1/images/edits`，至少要 1 张图。case_20 这种"生成第一人称视角的古代战场..."的纯描述请求 batch_runner 会校验失败 + 提示用户切换到 B skill（B 的 `generate` 子命令支持 text2im）
+- **0 张图（纯文字生图 text2im）**：A v0.1.3 起支持，走 `/v1/images/generations` 端点。仍走 rewrite_prompt + SENTINEL/CJK 双闸。case_20 这种"生成第一人称视角的古代战场..."的纯描述请求现在 A 能跑。**Anchor mode 不支持 0 图**（vision verify 需要图，0 图请求自动落 standard mode）
 
 ### Batch UX 模式下 agent 的边界（2026-05-14 重写，跟 scripts/ 对齐）
 

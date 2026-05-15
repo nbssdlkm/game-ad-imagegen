@@ -92,14 +92,16 @@ def generate(
     inject_quality_invariants: bool = True,
 ) -> dict:
     """
-    单图生成（recipe 版 — /v1/images/edits 直走 gpt-image-2，无 L2 rewriter）。
+    生成 game-ad 图(走 gpt-image-2,无 L2 rewriter)。
 
     参数：
       rewritten_prompt: 已经过 LLM rewriting 的英文 prompt（详细字段化版本）
-      reference_images: 参考图列表（第 1 张 = Image A 风格 anchor，其余 = 角色/资产源）
+      reference_images: 参考图列表
+        - 空 list → 纯文字生图(game-ad text2im,如纯文字生买量 banner / 海报),走 /v1/images/generations
+        - ≥1 张 → edit / composite,走 /v1/images/edits
       out_path: 输出 PNG 路径
 
-    返回 dict 含：out_path / revised_prompt(=None) / usage / http_status
+    返回 dict 含：out_path / revised_prompt(=None) / usage / http_status / endpoint
     """
     rewritten_prompt = _assert_and_strip_sentinel(rewritten_prompt)
     _assert_prompt_is_rewritten(rewritten_prompt)
@@ -112,7 +114,9 @@ def generate(
     prompt_parts.append(rewritten_prompt)
     final_prompt = "\n\n".join(prompt_parts)
 
-    print(f"  POST {base_url.rstrip('/')}/images/edits  model={DEFAULT_IMG_MODEL}  size={size}  quality={quality}  refs={len(reference_images)}")
+    use_text2im = len(reference_images) == 0
+    endpoint = "generations" if use_text2im else "edits"
+    print(f"  POST {base_url.rstrip('/')}/images/{endpoint}  model={DEFAULT_IMG_MODEL}  size={size}  quality={quality}  refs={len(reference_images)}")
 
     client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout_sec)
 
@@ -123,16 +127,15 @@ def generate(
         "size": size,
         "quality": quality,
         "reference_image_count": len(reference_images),
-        "revised_prompt": None,  # /v1/images/edits 无 L2 rewriter
+        "endpoint": endpoint,
+        "revised_prompt": None,
     }
 
-    # 打开参考图 file handles（list of 1+）
-    file_handles = [open(p, "rb") for p in reference_images]
-    try:
+    if use_text2im:
+        # 0 图模式: /v1/images/generations (game-ad 纯文字生买量素材)
         try:
-            response = client.images.edit(
+            response = client.images.generate(
                 model=DEFAULT_IMG_MODEL,
-                image=file_handles if len(file_handles) > 1 else file_handles[0],
                 prompt=final_prompt,
                 size=size,
                 quality=quality,
@@ -142,13 +145,31 @@ def generate(
         except Exception as exc:
             result["http_status"] = getattr(exc, "status_code", 500)
             result["error_body"] = str(exc)[:5000]
-            raise RuntimeError(f"image_gen edit failed: {exc}") from exc
-    finally:
-        for f in file_handles:
+            raise RuntimeError(f"image_gen generate failed: {exc}") from exc
+    else:
+        # 有图模式: /v1/images/edits
+        file_handles = [open(p, "rb") for p in reference_images]
+        try:
             try:
-                f.close()
-            except Exception:
-                pass
+                response = client.images.edit(
+                    model=DEFAULT_IMG_MODEL,
+                    image=file_handles if len(file_handles) > 1 else file_handles[0],
+                    prompt=final_prompt,
+                    size=size,
+                    quality=quality,
+                    n=1,
+                )
+                result["http_status"] = 200
+            except Exception as exc:
+                result["http_status"] = getattr(exc, "status_code", 500)
+                result["error_body"] = str(exc)[:5000]
+                raise RuntimeError(f"image_gen edit failed: {exc}") from exc
+        finally:
+            for f in file_handles:
+                try:
+                    f.close()
+                except Exception:
+                    pass
 
     # usage 字段（SDK 可能不暴露，best-effort）
     try:
@@ -174,7 +195,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prompt", help="rewritten prompt 字符串（直接传）")
     ap.add_argument("--prompt-file", help="prompt 文件路径（推荐，避免 shell 转义）")
-    ap.add_argument("--refs", required=True, help="参考图路径，逗号分隔")
+    ap.add_argument("--refs", default="", help="参考图路径,逗号分隔(留空 = 0 图 text2im 模式,走 /v1/images/generations)")
     ap.add_argument("--out", required=True, help="输出 PNG 路径")
     ap.add_argument("--meta-out", help="meta JSON 输出路径（可选）")
     ap.add_argument("--size", default=DEFAULT_IMG_SIZE, help=f"输出尺寸，默认 {DEFAULT_IMG_SIZE}")
@@ -189,7 +210,7 @@ def main():
     else:
         ap.error("必须传 --prompt 或 --prompt-file")
 
-    refs = [Path(p.strip()) for p in args.refs.split(",") if p.strip()]
+    refs = [Path(p.strip()) for p in args.refs.split(",") if p.strip()] if args.refs else []
     for r in refs:
         if not r.exists():
             ap.error(f"参考图不存在：{r}")
