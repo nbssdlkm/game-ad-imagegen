@@ -72,16 +72,15 @@ function buildConfig() {
     const sizeOverride = card.querySelector('.size_override').value;
     const qualityOverride = card.querySelector('.quality_override').value;
 
+    // anchor 是默认且唯一模式 — anchor_candidates 永远写入(default 3, 用户可改 2-10)。
+    // batch_runner.py 已删 standard mode,n<2 / ref=0 会 reject。
     const task = {
       task_id: `t${String(i + 1).padStart(2, '0')}`,
       reference_images,
       prompt,
       n,
+      anchor_candidates: anchorCandidates || 3,
     };
-    // anchor_candidates: 只在 anchorCandidates >= 2 AND n >= 2 时写入。
-    // 单图场景(n=1)即使 form 默认 anchor=3 也不写,避免 batch_runner 报
-    // "anchor_candidates=3 但 n=1" 校验错误 — n=1 不可能跑 anchor mode(没 series 可生)。
-    if (anchorCandidates >= 2 && n >= 2) task.anchor_candidates = anchorCandidates;
     if (sizeOverride) task.size = sizeOverride;
     if (qualityOverride) task.quality = qualityOverride;
     tasks.push(task);

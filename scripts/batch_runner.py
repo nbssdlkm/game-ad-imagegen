@@ -246,20 +246,24 @@ def main():
                 errors.append(f"{tid}: 参考图不存在 — {p}")
         if not (t.get("prompt") or "").strip():
             errors.append(f"{tid}: prompt 不能空")
+        # ⚠️ Product 决策: anchor 是默认且唯一模式(user 反复强调)。
+        # 删除了 standard mode 回退路径 — 凡 task 必走 anchor: Phase 1 候选 → 人工挑 → Phase 3 锁风格生剩余。
+        # 0 图 text2im / 单图 edit 这类无法锁风格的场景,请走 B skill (codex-imagegen-fork)。
         n = int(t.get("n", 1))
-        if n < 1 or n > 10:
-            errors.append(f"{tid}: n 应在 1-10(实际 {n})")
-        # anchor_candidates 范围 + n>=2 配套校验
-        M_anchor = int(t.get("anchor_candidates", 0))
-        if M_anchor > 0 and M_anchor < 2:
-            errors.append(f"{tid}: anchor_candidates={M_anchor} 无效, 必须 ≥2 才启用 anchor mode (或 0/缺省关闭)")
+        if n < 2:
+            errors.append(f"{tid}: n={n} 无效 — anchor 是默认且唯一模式, n 必须 ≥2 (候选 + 锁风格 series)。0 图 text2im / 单图 edit 请用 B skill")
+        if n > 10:
+            errors.append(f"{tid}: n={n} 超过上限 10")
+        if len(refs) == 0:
+            errors.append(f"{tid}: 至少 1 张参考图 — anchor 需要 vision 抽候选 + Phase 3 锁风格 ref")
+        # anchor_candidates 默认 3 (user 不填 → 自动注入)
+        DEFAULT_ANCHOR_CANDIDATES = 3
+        M_anchor = int(t.get("anchor_candidates", 0)) or DEFAULT_ANCHOR_CANDIDATES
+        t["anchor_candidates"] = M_anchor  # 写回 task,统一下游读取
+        if M_anchor < 2:
+            errors.append(f"{tid}: anchor_candidates={M_anchor} 无效, 必须 ≥2")
         if M_anchor > 10:
             errors.append(f"{tid}: anchor_candidates={M_anchor} 超过上限 10 (太多候选浪费 token)")
-        if M_anchor >= 2 and n < 2:
-            errors.append(f"{tid}: anchor_candidates={M_anchor} (≥2) 但 n={n} (<2); anchor mode 需要 n>=2 才能产 N-1 张 series; 改 n>=2 或删 anchor_candidates")
-        # anchor mode 需要 ≥1 张参考图(Phase 3 把 picked anchor 作 ref,Phase 1 也要 vision)
-        if M_anchor >= 2 and len(refs) == 0:
-            errors.append(f"{tid}: anchor_candidates={M_anchor} 需要 ≥1 张参考图 (0 图 text2im 不支持 anchor workflow)")
 
     if errors:
         print(f"\n! 校验失败 ({len(errors)} 个问题):", file=sys.stderr)
@@ -268,27 +272,16 @@ def main():
         return 2
 
     # ===== 跑批 =====
-    # Anchor workflow (anchor_candidates >= 2 + n >= 2 时启用):
-    #   Phase 1: 跑 M 张候选(同段 prompt × M sampling),user 挑 1 张
+    # Anchor workflow (默认且唯一模式, 凡 task 必走):
+    #   Phase 1: 跑 M 张候选(同段 prompt × M sampling), user 挑 1 张
     #   Phase 2: poll {batch_id}_anchor_picks.json
     #   Phase 3: picked anchor → t01.png + rewrite N-1 段 with picked anchor in refs → 跑 N-1 张
-    # 单 task 总图数 = M (candidates) + (n-1) (series w/o picked anchor 那张,copied not generated)
-    def _is_anchor_mode(t):
-        M = int(t.get("anchor_candidates", 0))
-        return M >= 2 and int(t.get("n", 1)) >= 2
-
+    # 单 task 总图数 = M (candidates) + n (1 picked-anchor copy + n-1 generated series)
     def _task_image_count(t):
-        n = int(t.get("n", 1))
-        if _is_anchor_mode(t):
-            # anchor mode: M candidates (Phase 1) + n final outputs (1 picked-anchor copy + n-1 generated series)
-            # 注意:之前是 M + (n-1),少算了 picked anchor 那张 → img_seq 超界 1 张 (glm-5.1 review 抓出)
-            return int(t["anchor_candidates"]) + n
-        return n
+        return int(t["anchor_candidates"]) + int(t["n"])
 
     n_images_total = sum(_task_image_count(t) for t in tasks)
-    n_anchor_tasks = sum(1 for t in tasks if _is_anchor_mode(t))
-    anchor_summary = f", {n_anchor_tasks} task(s) in anchor mode" if n_anchor_tasks > 0 else ""
-    print(f"=== batch {batch_id} [skill=a · game-ad-imagegen]: {len(tasks)} 任务 × ~ = {n_images_total} 张图{anchor_summary} ===", flush=True)
+    print(f"=== batch {batch_id} [skill=a · game-ad-imagegen · anchor-only]: {len(tasks)} 任务 × ~ = {n_images_total} 张图 ===", flush=True)
     print(f"  image_gen.py: {IMAGE_GEN_PY}", flush=True)
     print(f"  out_dir: {out_dir}", flush=True)
     print(f"  defaults: size={batch_size}, quality={batch_quality}", flush=True)
@@ -340,150 +333,88 @@ def main():
         task_id = task["task_id"]
         refs = [Path(p) for p in task["reference_images"]]
         prompt = task["prompt"]
-        n = int(task.get("n", 1))
+        n = int(task["n"])
         task_size = task.get("size") or batch_size
         task_quality = task.get("quality") or batch_quality
-        is_anchor = _is_anchor_mode(task)
-        M = int(task.get("anchor_candidates", 0)) if is_anchor else 0
+        M = int(task["anchor_candidates"])
 
-        # anchor mode 时把 refs 复制到 out_dir,让 anchor_pick.html 用相对路径能 load ref 缩略图
+        # 把 refs 复制到 out_dir,让 anchor_pick.html 用相对路径能 load ref 缩略图
         # (否则 user 看到 anchor_pick.html 时 ref 缩略图全 broken,需要手动 copy refs)
-        if is_anchor:
-            import shutil as _shutil
-            for _ref in refs:
-                _ref_dst = out_dir / Path(_ref).name
-                if not _ref_dst.exists():
-                    try:
-                        _shutil.copy(_ref, _ref_dst)
-                    except Exception as _e:
-                        print(f"  ! [task {task_id}] copy ref {_ref.name} → out_dir 失败(继续): {_e}", file=sys.stderr, flush=True)
+        import shutil as _shutil
+        for _ref in refs:
+            _ref_dst = out_dir / Path(_ref).name
+            if not _ref_dst.exists():
+                try:
+                    _shutil.copy(_ref, _ref_dst)
+                except Exception as _e:
+                    print(f"  ! [task {task_id}] copy ref {_ref.name} → out_dir 失败(继续): {_e}", file=sys.stderr, flush=True)
 
-        # === Vision + Rewrite (Mode 2 → 跟 Mode 1 对齐的核心能力) ===
+        # === Vision + Rewrite + Phase 1: 同段 prompt × M 次 sampling 出候选 ===
         # Invariant: 实跑路径必走 rewrite。失败 → 异常 propagate → batch 整批 fail-fast。
         # dry-run 不发 API,可用原 prompt 仅作 schema 预览。
-        if is_anchor:
-            # ==========================================================
-            # === Anchor mode Phase 1: 同段 prompt × M 次 sampling 出候选 ===
-            # ==========================================================
-            if args.dry_run:
-                cand_prompt = prompt
-            else:
-                print(f"\n[task {task_id}] (anchor Phase 1) vision + rewrite ({len(refs)} refs, M={M} candidates)...", flush=True)
-                _ensure_scripts_in_syspath()
-                from rewrite_prompt import rewrite as _do_rewrite
-                _cand_prompts = _do_rewrite(prompt, refs, n=1, anchor_phase="phase1")
-                cand_prompt = _cand_prompts[0]
-                (out_dir / f"{task_id}_prompt_original.txt").write_text(prompt, encoding="utf-8")
-                print(f"[task {task_id}] Phase 1 rewrite done ({len(cand_prompt)} chars)", flush=True)
-
-            cand_prompt_file = out_dir / f"{task_id}_anchor_cand_prompt.txt"
-            cand_prompt_file.write_text(cand_prompt, encoding="utf-8")
-
-            candidate_paths = []
-            for ci in range(1, M + 1):
-                img_seq += 1
-                cand_out = out_dir / f"{task_id}_anchor_cand_{ci:02d}.png"
-                cand_meta = out_dir / f"{task_id}_anchor_cand_{ci:02d}_meta.json"
-                candidate_paths.append(cand_out)
-
-                print(f"\n--- {img_seq}/{n_images_total}  ({task_id} anchor cand {ci}/{M}) ---", flush=True)
-                print(f"  refs ({len(refs)}): {[r.name for r in refs]}", flush=True)
-                print(f"  size={task_size}, quality={task_quality}", flush=True)
-                print(f"  prompt: {cand_prompt[:100]}{'...' if len(cand_prompt) > 100 else ''}", flush=True)
-
-                if args.dry_run:
-                    preview_cmd = build_cmd(cand_prompt_file, refs, cand_out, cand_meta, task_size, task_quality)
-                    print(f"  $ [dry-run] {' '.join(str(c) for c in preview_cmd[:6])} ...", flush=True)
-                    res = {"out_path": str(cand_out), "http_status": 200, "elapsed_sec": 0.0, "_dry_run": True}
-                else:
-                    try:
-                        res = run_one(cand_prompt_file, refs, cand_out, cand_meta, task_size, task_quality)
-                    except Exception as e:
-                        import traceback as _tb2
-                        print(f"\n    ! run_one(anchor cand) 异常: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-                        res = {"out_path": str(cand_out), "http_status": None, "elapsed_sec": 0.0,
-                               "error": f"run_one raised: {type(e).__name__}: {e}\n{_tb2.format_exc()[-1500:]}"}
-                res.update({
-                    "task_id": task_id,
-                    "skill": THIS_SKILL_ID,
-                    "task_seq_in_batch": t_idx,
-                    "image_seq_in_task": -ci,  # 负数 = anchor candidate
-                    "is_anchor_candidate": True,
-                    "anchor_candidate_idx": ci,
-                    "reference_images": [str(r) for r in refs],
-                    "prompt": prompt,
-                    "size": task_size,
-                    "quality": task_quality,
-                })
-                all_results.append(res)
-                if not args.dry_run:
-                    _write_incremental_progress(all_results, n_images_total, status="running")
-
-            # Stash 给后面 Phase 2+3 用
-            anchor_pending_tasks.append({
-                "t_idx": t_idx,
-                "task": task,
-                "refs": refs,
-                "candidate_paths": candidate_paths,
-                "task_size": task_size,
-                "task_quality": task_quality,
-            })
-
+        if args.dry_run:
+            cand_prompt = prompt
         else:
-            # ==========================================================
-            # === Standard mode: 沿用 N 段不同主体 prompt 流程 ===
-            # ==========================================================
+            print(f"\n[task {task_id}] (anchor Phase 1) vision + rewrite ({len(refs)} refs, M={M} candidates)...", flush=True)
+            _ensure_scripts_in_syspath()
+            from rewrite_prompt import rewrite as _do_rewrite
+            _cand_prompts = _do_rewrite(prompt, refs, n=1, anchor_phase="phase1")
+            cand_prompt = _cand_prompts[0]
+            (out_dir / f"{task_id}_prompt_original.txt").write_text(prompt, encoding="utf-8")
+            print(f"[task {task_id}] Phase 1 rewrite done ({len(cand_prompt)} chars)", flush=True)
+
+        cand_prompt_file = out_dir / f"{task_id}_anchor_cand_prompt.txt"
+        cand_prompt_file.write_text(cand_prompt, encoding="utf-8")
+
+        candidate_paths = []
+        for ci in range(1, M + 1):
+            img_seq += 1
+            cand_out = out_dir / f"{task_id}_anchor_cand_{ci:02d}.png"
+            cand_meta = out_dir / f"{task_id}_anchor_cand_{ci:02d}_meta.json"
+            candidate_paths.append(cand_out)
+
+            print(f"\n--- {img_seq}/{n_images_total}  ({task_id} anchor cand {ci}/{M}) ---", flush=True)
+            print(f"  refs ({len(refs)}): {[r.name for r in refs]}", flush=True)
+            print(f"  size={task_size}, quality={task_quality}", flush=True)
+            print(f"  prompt: {cand_prompt[:100]}{'...' if len(cand_prompt) > 100 else ''}", flush=True)
+
             if args.dry_run:
-                rewritten_prompts = [prompt] * n
+                preview_cmd = build_cmd(cand_prompt_file, refs, cand_out, cand_meta, task_size, task_quality)
+                print(f"  $ [dry-run] {' '.join(str(c) for c in preview_cmd[:6])} ...", flush=True)
+                res = {"out_path": str(cand_out), "http_status": 200, "elapsed_sec": 0.0, "_dry_run": True}
             else:
-                print(f"\n[task {task_id}] vision + rewrite step ({len(refs)} refs, n={n})...", flush=True)
-                _ensure_scripts_in_syspath()
-                from rewrite_prompt import rewrite as _do_rewrite
-                rewritten_prompts = _do_rewrite(prompt, refs, n=n)
-                (out_dir / f"{task_id}_prompt_original.txt").write_text(prompt, encoding="utf-8")
-                total_chars = sum(len(p) for p in rewritten_prompts)
-                print(f"[task {task_id}] rewrite done ({len(rewritten_prompts)} prompts, {total_chars} chars total)", flush=True)
+                try:
+                    res = run_one(cand_prompt_file, refs, cand_out, cand_meta, task_size, task_quality)
+                except Exception as e:
+                    import traceback as _tb2
+                    print(f"\n    ! run_one(anchor cand) 异常: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+                    res = {"out_path": str(cand_out), "http_status": None, "elapsed_sec": 0.0,
+                           "error": f"run_one raised: {type(e).__name__}: {e}\n{_tb2.format_exc()[-1500:]}"}
+            res.update({
+                "task_id": task_id,
+                "skill": THIS_SKILL_ID,
+                "task_seq_in_batch": t_idx,
+                "image_seq_in_task": -ci,  # 负数 = anchor candidate
+                "is_anchor_candidate": True,
+                "anchor_candidate_idx": ci,
+                "reference_images": [str(r) for r in refs],
+                "prompt": prompt,
+                "size": task_size,
+                "quality": task_quality,
+            })
+            all_results.append(res)
+            if not args.dry_run:
+                _write_incremental_progress(all_results, n_images_total, status="running")
 
-            while len(rewritten_prompts) < n:
-                rewritten_prompts.append(rewritten_prompts[-1])
-
-            for i in range(1, n + 1):
-                img_seq += 1
-                prompt_file = out_dir / f"{task_id}_{i:02d}_prompt.txt"
-                prompt_file.write_text(rewritten_prompts[i - 1], encoding="utf-8")
-                out_path = out_dir / f"{task_id}_{i:02d}.png"
-                meta_path = out_dir / f"{task_id}_{i:02d}_meta.json"
-                print(f"\n--- {img_seq}/{n_images_total}  ({task_id} {i}/{n}) ---", flush=True)
-                print(f"  refs ({len(refs)}): {[r.name for r in refs]}", flush=True)
-                print(f"  size={task_size}, quality={task_quality}", flush=True)
-                _this_p = rewritten_prompts[i - 1]
-                print(f"  prompt: {_this_p[:100]}{'...' if len(_this_p) > 100 else ''}", flush=True)
-
-                if args.dry_run:
-                    preview_cmd = build_cmd(prompt_file, refs, out_path, meta_path, task_size, task_quality)
-                    print(f"  $ [dry-run] {' '.join(str(c) for c in preview_cmd[:6])} ...", flush=True)
-                    res = {"out_path": str(out_path), "http_status": 200, "elapsed_sec": 0.0, "_dry_run": True}
-                else:
-                    try:
-                        res = run_one(prompt_file, refs, out_path, meta_path, task_size, task_quality)
-                    except Exception as e:
-                        import traceback as _tb2
-                        print(f"\n    ! run_one 内异常(catch + 继续下一张): {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-                        res = {"out_path": str(out_path), "http_status": None, "elapsed_sec": 0.0,
-                               "error": f"run_one raised: {type(e).__name__}: {e}\n{_tb2.format_exc()[-1500:]}"}
-                res.update({
-                    "task_id": task_id,
-                    "skill": THIS_SKILL_ID,
-                    "task_seq_in_batch": t_idx,
-                    "image_seq_in_task": i,
-                    "reference_images": [str(r) for r in refs],
-                    "prompt": prompt,
-                    "size": task_size,
-                    "quality": task_quality,
-                })
-                all_results.append(res)
-                if not args.dry_run:
-                    _write_incremental_progress(all_results, n_images_total, status="running")
+        # Stash 给后面 Phase 2+3 用
+        anchor_pending_tasks.append({
+            "t_idx": t_idx,
+            "task": task,
+            "refs": refs,
+            "candidate_paths": candidate_paths,
+            "task_size": task_size,
+            "task_quality": task_quality,
+        })
 
     # ==========================================================
     # === Anchor mode Phase 2: render anchor_pick.html + poll picks JSON ===
@@ -616,7 +547,7 @@ def main():
             })
             _write_incremental_progress(all_results, n_images_total, status="running")
 
-            # 防御性 check: 当前 _is_anchor_mode 要求 n>=2 所以 n-1>=1,但加 check 防未来回归
+            # 防御性 check: 当前校验段要求 n>=2 所以 n-1>=1,但加 check 防未来回归
             n_series = n - 1
             if n_series < 1:
                 print(f"[task {task_id}] Phase 3 skipped (n={n} → n-1={n_series} < 1, anchor + 0 series, picked anchor 已 copy 为唯一输出)", flush=True)
