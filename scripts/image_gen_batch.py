@@ -1,25 +1,36 @@
 #!/usr/bin/env python
 """
-game-ad-imagegen / image_gen_batch.py - 批量生成（带 anchor）
-=============================================================
+⚠️ [DEPRECATED v0.1.3 2026-05-15] image_gen_batch.py — 早期 first-anchor 批量入口
+================================================================================
 
-模拟 T8 操作流程的"第二步 batch_requests"：
+本脚本是 v0.1.0 早期的"first-anchor 策略"批量入口,功能跟新的 anchor mode 概念重叠。
+
+**改用新路径**(全功能等价 + UI + invariant 保护):
+  - 简单批量:    `scripts/batch_runner.py` + `web/batch_form.html` (HTML 表单驱动)
+  - Anchor 锁风格系列广告: 同上 + form 设 anchor_candidates >= 2 (Phase 1/2/3 自动跑)
+
+本脚本保留只为向后兼容(已有 caller 不动),不再加新功能。**调用时会向 stderr 打 DEPRECATED warning**。
+calls into `image_gen.generate()` 仍走完整 invariant 闸(SENTINEL + CJK),不破 invariant。
+
+================================================================================
+原 docstring:
+
+模拟 T8 操作流程的"第二步 batch_requests":
   1. 第一段 prompt 调 image_gen.py → 拿到第 1 张图 + revised_prompt
-  2. 第二段~第 N 段 prompt：每段调 image_gen.py，参考图 = 原参考图 + 第 1 张图（anchor）
-  3. 这样 N-1 张共享同一系列锚点，视觉风格更一致
+  2. 第二段~第 N 段 prompt:每段调 image_gen.py,参考图 = 原参考图 + 第 1 张图(anchor)
+  3. 这样 N-1 张共享同一系列锚点,视觉风格更一致
 
-调用：
-
+调用:
   python image_gen_batch.py --config batch.json
 
-batch.json 格式：
+batch.json 格式:
   {
     "rewritten_prompts": ["...第1段...", "...第2段...", ...],
     "reference_images": ["ref1.png", "ref2.png"],
     "out_dir": "outputs/runX",
-    "out_basename": "ad",          # 可选，默认 ad，最终文件名 ad_01.png ad_02.png ...
+    "out_basename": "ad",          # 可选,默认 ad
     "anchor_strategy": "first",    # first / none
-    "size": "1536x1024",           # 可选，默认合法横版尺寸
+    "size": "1536x1024",           # 可选,默认合法横版尺寸
     "quality": "high"              # 可选
   }
 """
@@ -98,6 +109,12 @@ def run_batch(
 
 
 def main():
+    print(
+        "⚠️ [DEPRECATED v0.1.3] image_gen_batch.py is deprecated. "
+        "Use `scripts/batch_runner.py` + `web/batch_form.html` instead (anchor mode UI built-in). "
+        "This script will be removed in v0.2.",
+        file=sys.stderr,
+    )
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True, help="batch JSON 配置路径")
     ap.add_argument("--meta-out", help="批量 meta JSON 输出路径（默认 out_dir/_batch_meta.json）")
