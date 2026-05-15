@@ -92,10 +92,21 @@
       <span class="hint inline" style="margin-top:4px;color:#b8860b">⚠️ <strong>图里的每个文字位都要明示</strong> — 主标题/副标题/角色名牌/CTA 按钮分别写啥(用引号原文),没说的位置 GPT 会凭训练先验编个看起来"合理"但跟图不符的字。不需要的位置明说"留空"。</span>
     </div>
     <div class="row">
-      <label>出图数</label>
+      <label>出图数 (n)</label>
       <input type="number" class="n" min="1" max="10" value="1" style="width:60px">
-      <span class="hint inline" style="margin-left:8px;color:#666">填几就独立跑几次,每次出 1 张 PNG</span>
-      <label style="margin-left:18px">尺寸 override</label>
+      <span class="hint inline" style="margin-left:8px;color:#666">这次要出几张图(独立任务)。n≥2 时 anchor 模式自动启用(下方字段控制),n=1 时只出单图,不走 anchor。</span>
+    </div>
+    <div class="row">
+      <label>锁风格抽卡数 (anchor)</label>
+      <input type="number" class="anchor_candidates" min="2" max="10" value="3" style="width:60px">
+      <span class="hint inline" style="margin-left:8px;color:#666">
+        <strong>anchor 是默认流程</strong>:n≥2 时本字段自动启用 Phase1 跑 M 张候选 → 你挑最满意 1 张 → Phase3 锁风格出 N-1 张系列(画风/UI/字效一致)。
+        <br>M 默认 3(可调 2-10)。总图数 = M + n(例: M=3 + n=5 → 8 张;M=3 + n=2 → 5 张)。
+        <br>n=1 时本字段被忽略(单图无须 anchor)。
+      </span>
+    </div>
+    <div class="row">
+      <label>尺寸 override</label>
       <select class="size_override">
         <option value="">跟随默认</option>
         <option value="1536x1024">1536×1024 横版</option>

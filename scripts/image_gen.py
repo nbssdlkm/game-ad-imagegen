@@ -35,11 +35,50 @@ from openai import OpenAI
 
 sys.path.insert(0, str(Path(__file__).parent))
 from _config import (
-    DEFAULT_LM_MODEL, DEFAULT_IMG_SIZE, DEFAULT_IMG_QUALITY,
+    DEFAULT_IMG_SIZE, DEFAULT_IMG_QUALITY,
     DEFAULT_TIMEOUT_SEC, QUALITY_INVARIANTS, load_credentials,
 )
 
 DEFAULT_IMG_MODEL = "gpt-image-2"  # /v1/images/edits 实际 model（不再用 gpt-5.5 作 L2）
+
+# Must match SENTINEL in rewrite_prompt.py — proof-of-origin marker that the prompt
+# was produced by rewrite_prompt.py rather than typed by an agent / pasted by user.
+SENTINEL = "# REWRITTEN-V1"
+
+
+def _assert_and_strip_sentinel(prompt: str) -> str:
+    """Hard rail #1 (strong invariant): the prompt MUST start with SENTINEL marker,
+    proving it came from rewrite_prompt.py. Missing marker → caller didn't rewrite
+    (agent偷懒手写 / 用户直接粘贴 / 拼音蒙混 / 任何其他来源) → raise. After
+    verification, strip the marker line so it does not leak into the image API."""
+    stripped = prompt.lstrip()
+    if not stripped.startswith(SENTINEL):
+        raise RuntimeError(
+            f"prompt invariant violation: missing sentinel marker {SENTINEL!r} on first "
+            f"non-blank line. Every prompt sent to the image API MUST be produced by "
+            f"rewrite_prompt.py (which prepends this marker). first 200 chars: {prompt[:200]!r}"
+        )
+    nl = stripped.find('\n')
+    if nl == -1:
+        return ""
+    return stripped[nl + 1:]
+
+
+def _assert_prompt_is_rewritten(prompt: str) -> None:
+    """Hard rail: 进 image API 的 prompt 必须是 rewrite_prompt.py 产出的英文版本。
+    raw 中文 user prompt 直接进 gpt-image-2 会塌(case_22 / case_24)。
+    rewritten prompt 里 verbatim text positions 用 quote 包,CJK 占比远低于 10%。"""
+    cjk = sum(1 for c in prompt if '一' <= c <= '鿿' or '㐀' <= c <= '䶿')
+    if cjk == 0:
+        return
+    total = sum(1 for c in prompt if not c.isspace())
+    if total == 0 or cjk / total <= 0.10:
+        return
+    raise RuntimeError(
+        f"prompt invariant violation: {cjk} CJK chars / {total} non-ws ({cjk/total:.0%}); "
+        f"refusing raw Chinese prompt at image API. Caller must pre-rewrite via "
+        f"rewrite_prompt.py. first 200 chars: {prompt[:200]!r}"
+    )
 
 
 def generate(
@@ -47,7 +86,6 @@ def generate(
     reference_images: list[Path],
     out_path: Path,
     *,
-    lm_model: str = DEFAULT_LM_MODEL,   # 保留参数兼容 batch caller；新路径忽略此值
     size: str = DEFAULT_IMG_SIZE,
     quality: str = DEFAULT_IMG_QUALITY,
     timeout_sec: int = DEFAULT_TIMEOUT_SEC,
@@ -60,10 +98,11 @@ def generate(
       rewritten_prompt: 已经过 LLM rewriting 的英文 prompt（详细字段化版本）
       reference_images: 参考图列表（第 1 张 = Image A 风格 anchor，其余 = 角色/资产源）
       out_path: 输出 PNG 路径
-      lm_model: backward-compat 参数，新路径忽略（无 L2 conversational model）
 
     返回 dict 含：out_path / revised_prompt(=None) / usage / http_status
     """
+    rewritten_prompt = _assert_and_strip_sentinel(rewritten_prompt)
+    _assert_prompt_is_rewritten(rewritten_prompt)
     base_url, api_key = load_credentials()
 
     # 构造最终 prompt（QUALITY_INVARIANTS 注入到开头，跟原路径同语义）
@@ -80,7 +119,7 @@ def generate(
     result = {
         "out_path": str(out_path),
         "http_status": None,
-        "lm_model": DEFAULT_IMG_MODEL,
+        "img_model": DEFAULT_IMG_MODEL,
         "size": size,
         "quality": quality,
         "reference_image_count": len(reference_images),
@@ -138,7 +177,6 @@ def main():
     ap.add_argument("--refs", required=True, help="参考图路径，逗号分隔")
     ap.add_argument("--out", required=True, help="输出 PNG 路径")
     ap.add_argument("--meta-out", help="meta JSON 输出路径（可选）")
-    ap.add_argument("--lm", default=DEFAULT_LM_MODEL, help=f"对话模型，默认 {DEFAULT_LM_MODEL}")
     ap.add_argument("--size", default=DEFAULT_IMG_SIZE, help=f"输出尺寸，默认 {DEFAULT_IMG_SIZE}")
     ap.add_argument("--quality", default=DEFAULT_IMG_QUALITY, help="质量")
     ap.add_argument("--no-invariants", action="store_true", help="禁用 QUALITY_INVARIANTS 注入（调试用）")
@@ -160,7 +198,6 @@ def main():
         rewritten_prompt=rewritten_prompt,
         reference_images=refs,
         out_path=Path(args.out),
-        lm_model=args.lm,
         size=args.size,
         quality=args.quality,
         inject_quality_invariants=not args.no_invariants,

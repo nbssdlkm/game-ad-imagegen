@@ -31,6 +31,17 @@ from _config import DEFAULT_LM_MODEL, DEFAULT_TIMEOUT_SEC, load_credentials
 # n>1 时各段之间的分隔符。LLM 必须在独立行上输出此标记。
 PROMPT_SEP = "---PROMPT-SEP---"
 
+# Proof-of-origin marker prepended to every rewritten prompt. image_gen.py
+# verifies this marker before sending the prompt to the image API — any prompt
+# lacking the marker is refused (caller must run rewrite_prompt.py first).
+# image_gen.py strips this line after verification so it does not reach the model.
+SENTINEL = "# REWRITTEN-V1"
+
+
+def _wrap_with_sentinel(prompt: str) -> str:
+    """Prefix the rewritten prompt with the SENTINEL marker line."""
+    return f"{SENTINEL}\n{prompt.strip()}"
+
 
 REWRITE_SYSTEM = f"""You are the prompt-rewriting agent inside the `game-ad-imagegen` skill.
 
@@ -221,34 +232,43 @@ def rewrite(user_prompt: str, reference_images, n: int = 1, model: str = None, v
     if verbose:
         print(f"  [rewrite] model={model}  refs={len(ref_paths)}  n={n}  user_prompt_chars={len(user_prompt)}", flush=True)
 
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": REWRITE_SYSTEM},
-            {"role": "user", "content": user_content},
-        ],
-    )
+    # reasoning_effort="high" 让 gpt-5.4 系列开思考模式提升 rewrite 质量;
+    # 模型 / 代理不支持该参数(旧模型 / 非 reasoning model / ephone 透传配置缺失)时
+    # 自动 fallback 到默认调用,保证向后兼容。其他错误(quota / network / 401 等)原样 raise。
+    _msgs = [
+        {"role": "system", "content": REWRITE_SYSTEM},
+        {"role": "user", "content": user_content},
+    ]
+    try:
+        response = client.chat.completions.create(
+            model=model, messages=_msgs, extra_body={"reasoning_effort": "high"},
+        )
+    except Exception as _e:
+        _emsg = str(_e).lower()
+        _unsupported = "reasoning" in _emsg and any(
+            s in _emsg for s in ("unknown", "unsupported", "invalid", "bad request", "400")
+        )
+        if not _unsupported:
+            raise
+        print(f"  [rewrite] WARN: model={model} rejects reasoning_effort='high'; retrying without it", file=sys.stderr, flush=True)
+        response = client.chat.completions.create(model=model, messages=_msgs)
     text = _strip_fence(response.choices[0].message.content or "")
 
     if n == 1:
-        return [text]
+        if not text:
+            raise RuntimeError("rewrite LLM returned empty output for n=1")
+        return [_wrap_with_sentinel(text)]
 
     # n>=2: 用 PROMPT_SEP 拆。容忍 leading/trailing whitespace + 可能的 "Prompt 1:" prefix
     raw_parts = [p.strip() for p in text.split(PROMPT_SEP)]
     parts = [_strip_fence(p) for p in raw_parts if p.strip()]
 
-    # 兜底 1: 如果 LLM 没产生 SEP (e.g. n 段被合并成 1 段),warn + 复制填满
-    # 兜底 2: 如果产生了 != n 段,截断或复制最后一段填到 n
+    # Invariant: rewrite 输出必须能拆出 ≥1 段。空 / 无 SEP → raise(不 fallback 到原中文)。
     if len(parts) == 0:
-        # text 可能完全为空(LLM 失败 / 超时) → 全空 prompt 喂 image_gen 必败
-        # 退到 user_prompt 让 image_gen 至少有内容跑 (虽然中文 prompt 在 form mode 会拼图,
-        # 但好过全空必败 — 至少 user 能看到原中文 prompt 跑出来的图,debug 路径清晰)
-        if not text:
-            print(f"  [rewrite] WARN: LLM returned empty output, falling back to original user_prompt × {n}", file=sys.stderr, flush=True)
-            return [user_prompt] * n
-        # text 有内容但没 SEP 标记 → 当 1 段 prompt 重复 n 次
-        print(f"  [rewrite] WARN: LLM returned content without SEP markers, treating as single prompt × {n}", file=sys.stderr, flush=True)
-        return [text] * n
+        snippet = (text[:200] + "...") if text else "(empty)"
+        raise RuntimeError(
+            f"rewrite LLM produced unparseable output (no PROMPT_SEP for n={n}>=2): {snippet!r}"
+        )
 
     if len(parts) < n:
         print(f"  [rewrite] WARN: expected {n} prompts, got {len(parts)}; padding with last", file=sys.stderr, flush=True)
@@ -258,7 +278,7 @@ def rewrite(user_prompt: str, reference_images, n: int = 1, model: str = None, v
         print(f"  [rewrite] WARN: expected {n} prompts, got {len(parts)}; truncating", file=sys.stderr, flush=True)
         parts = parts[:n]
 
-    return parts
+    return [_wrap_with_sentinel(p) for p in parts]
 
 
 def main():

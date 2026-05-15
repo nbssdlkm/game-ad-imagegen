@@ -10,6 +10,26 @@ description: |
 
 # game-ad-imagegen — 游戏买量图生成 Skill
 
+## 🚨 Hard Invariant — 必读
+
+**进入 image API 的每一个 prompt 必须由 `scripts/rewrite_prompt.py` 产出，无任何 bypass**。没有这条，出图质量退回 case_22 的中文 prompt 幻觉模式，skill 失去意义。
+
+`scripts/image_gen.py` 在入口处双闸校验：
+1. **SENTINEL marker 校验** — prompt 第一行必须是 `# REWRITTEN-V1`（由 `rewrite_prompt.py` 自动加在每段产出的开头）。缺标记 → `RuntimeError`，prompt 不发 API。
+2. **CJK 字符占比兜底** — 通过 SENTINEL 后再查 CJK 占比，>10% 即拒（防 rewrite LLM 偶发返回中文）。
+
+**已删的全部 bypass 路径**：
+- `--no-rewrite` CLI flag
+- `prompt_already_rewritten` config 字段（batch 级 / task 级）
+- rewrite 失败时静默 fallback 原中文 → 现在失败整批 fail-fast
+
+**对 agent 的硬约束**：
+- **Mode 1**：Step 4 必须**调 `python scripts/rewrite_prompt.py`** 让脚本做 vision + rewrite + 包 SENTINEL。**不要自己手写英文 prompt 然后调 `image_gen.py`** —— agent 手写的 prompt 没 SENTINEL 会被入口拦截。Step 4 详述的原则是 `rewrite_prompt.py` 内部 system prompt 在用的，贴在文档里供 agent 排错时理解 rewrite 行为，不是让 agent 自己复制粘贴照写。
+- **Mode 2**（batch UX）：`batch_runner.py` 自动调 `rewrite_prompt.py`，agent 不介入。
+- **Rewrite-only mode**（Step 4.5）：走 `rewrite_prompt.py` 拿到 SENTINEL-wrapped prompt 后把它输出到对话区让用户复制；不调 `image_gen.py`，跟 invariant 解耦。
+
+---
+
 ## 这个 skill 在干什么
 
 **复刻"网页 ChatGPT 出爆款游戏广告图"的工作流**——用户给爆款参考图 + 自家实机图 + 一段中文 prompt，agent 模拟网页 GPT-5.x 的 6 步操作（理解 → 拆解 → 选角色 → rewrite → 调 image_gen → 归档），输出 N 张高质量游戏广告图。
@@ -133,11 +153,23 @@ UserIntent:    { 输出张数: N,
 
 ---
 
-### Step 4: Prompt rewriting(核心,agent 自己写英文 prompt)
+### Step 4: Prompt rewriting（调 `rewrite_prompt.py`，不自己手写）
 
-把用户的中文需求 + Step 1-3 输出,**改写成 N 段详细英文 prompt**,每段对应 1 张图。**N>1 时各段必须不同主体角色**(从 Step 1 CandidatePool 各选一个,系列广告天然多样性),不要写 N 段 minor pose variations of same hero(等于 1 张图重复 N 次)。所有字段(角色视觉 / StyleSummary / 构图)只从 Step 1 vision call 当次抓取的内容填,**不要从外部翻历史模板或角色 lookup**。
+🚨 **Hard Invariant 要求**：agent 不自己手写英文 prompt 然后调 `image_gen.py`。改为：把用户中文需求 + 参考图路径 + 目标张数 N 传给 `scripts/rewrite_prompt.py`，让脚本做 vision + rewrite + SENTINEL 包装。
 
-**为什么 prompt 字面精度直接决定结果**:`image_gen.py` 切到 `/v1/images/edits` 端点后,**prompt 字面就是 image model 收到的,没有 L2 rewriter 二次改写**。verbatim 中文准确度靠 agent 字面精度,scene complexity 直接决定 image model text 渲染 budget。
+```bash
+python scripts/rewrite_prompt.py \
+  --user-prompt-file user_zh.txt \
+  --refs ref1.png,ref2.png \
+  --n 5 \
+  --out rewritten.txt
+```
+
+输出文件 `rewritten.txt` 每段以 `# REWRITTEN-V1` 开头（多段用 `---PROMPT-SEP---` 分隔），Step 5 把每段拆出来传给 `image_gen.py --prompt-file`。
+
+**下方原则是 `rewrite_prompt.py` 内部 system prompt 教 LLM 的规则**，贴在这里供 agent 排错时理解 rewrite 行为 / 解释结果给用户 / 微调用户原始中文需求。**agent 不要自己手抄这些规则写英文 prompt 然后塞给 image_gen** —— 入口 SENTINEL 闸会拦下，且这样做绕开了 `rewrite_prompt.py` 的 vision verify 环节。
+
+**为什么 prompt 字面精度直接决定结果**：`image_gen.py` 切到 `/v1/images/edits` 端点后，**prompt 字面就是 image model 收到的，没有 L2 rewriter 二次改写**。verbatim 中文准确度靠 rewrite 字面精度，scene complexity 直接决定 image model text 渲染 budget。
 
 #### 必须遵守的原则(case_24 / case_09 / case_04 跨场景验证)
 
@@ -429,7 +461,7 @@ batch UX **不预设图片角色**——`reference_images` 就是一个有序列
 
 **✅ batch_runner 自动做的事**（agent 不要重复）：
 
-- ✅ Per-task vision + rewrite：`batch_runner` 调 `scripts/rewrite_prompt.py` 对每个 task 跑 vision + LM rewrite，把中文需求转成 N 段（N=task.n）英文 image-gen prompt。**agent 不要自己再 rewrite 一遍 / 不要在 config 里塞预 rewrite 好的英文 prompt**（除非 task 显式标 `prompt_already_rewritten: true`）。
+- ✅ Per-task vision + rewrite：`batch_runner` 调 `scripts/rewrite_prompt.py` 对每个 task 跑 vision + LM rewrite，把中文需求转成 N 段（N=task.n）英文 image-gen prompt。**agent 不要自己再 rewrite 一遍 / 不要在 config 里塞预 rewrite 好的英文 prompt**。**Invariant**：rewrite 强制走（已删 `--no-rewrite` / `prompt_already_rewritten` 等 bypass 旗子），失败时 batch 整批 fail-fast；`image_gen.py` 入口有 CJK 字符兜底闸（>10% 中文即拒）阻止任何 raw 中文 prompt 触达 API。
 - ✅ N 段不同主体：`rewrite_prompt` 一次产 N 段独立 prompt，每段 feature 不同主体角色（系列多样性）。**agent 不要假设"5 张同 prompt 跑 5 次 sampling"**。
 - ✅ No QUALITY_INVARIANTS double-injection：`batch_runner` 调 `image_gen.py` 时传 `--no-invariants`，因为 rewrite layer 已经在 system prompt 里约束了 quality 规则。
 

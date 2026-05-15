@@ -19,8 +19,8 @@ from pathlib import Path
 # 默认参数（image_gen 调用层）
 # ============================================================
 
-DEFAULT_BASE_URL = "https://api.ephone.ai/v1"   # ephone API key 池，含 gpt-5.5 + gpt-image-2
-DEFAULT_LM_MODEL = "gpt-5.5"                     # rewriter / 工具调度
+DEFAULT_BASE_URL = "https://api.ephone.ai/v1"   # ephone API key 池
+DEFAULT_LM_MODEL = "gpt-5.4"                     # rewriter / 工具调度。rewrite_prompt 同时尝试 reasoning_effort="high"(若模型支持则启用思考模式),不支持时自动 fallback 到默认
 DEFAULT_IMG_SIZE = "1536x1024"                   # gpt-image-2 合法横版尺寸；默认映射到最接近 16:9 的 legal landscape
 DEFAULT_IMG_QUALITY = "medium"                   # medium 比 high 省约 60% 成本，质量差距不明显；正式 demo / 终稿可手动切 high
 DEFAULT_TIMEOUT_SEC = 600                        # 单次 image_gen 大约 30-90s，留余量

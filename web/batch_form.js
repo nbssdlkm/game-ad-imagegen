@@ -68,6 +68,7 @@ function buildConfig() {
     const reference_images = splitLines(card.querySelector('.reference_images').value);
     const prompt = card.querySelector('.prompt').value.trim();
     const n = parseInt(card.querySelector('.n').value, 10) || 1;
+    const anchorCandidates = parseInt(card.querySelector('.anchor_candidates').value, 10) || 0;
     const sizeOverride = card.querySelector('.size_override').value;
     const qualityOverride = card.querySelector('.quality_override').value;
 
@@ -77,6 +78,10 @@ function buildConfig() {
       prompt,
       n,
     };
+    // anchor_candidates: 只在 anchorCandidates >= 2 AND n >= 2 时写入。
+    // 单图场景(n=1)即使 form 默认 anchor=3 也不写,避免 batch_runner 报
+    // "anchor_candidates=3 但 n=1" 校验错误 — n=1 不可能跑 anchor mode(没 series 可生)。
+    if (anchorCandidates >= 2 && n >= 2) task.anchor_candidates = anchorCandidates;
     if (sizeOverride) task.size = sizeOverride;
     if (qualityOverride) task.quality = qualityOverride;
     tasks.push(task);
