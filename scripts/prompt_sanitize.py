@@ -92,22 +92,20 @@ COMMON_SIZES = {
 }
 
 
-def _aspect_to_size(w: int, h: int, target_max_pixels: int = 2_500_000) -> str:
-    """根据宽高比算合规 size (÷16 + ≤3840 边 + 总像素在 [655K, 8.3M])"""
+def _aspect_to_size(w: int, h: int, target_short: int = 1152) -> str:
+    """根据宽高比算合规 size (÷16 + ≤3840 边 + 总像素在 [655K, 8.3M])。
+    target_short 默认 1152 → 16:9 出 2048x1152 / 9:16 出 1152x2048 跟 COMMON_SIZES 一致。"""
     gcd_val = _gcd(w, h)
     w_norm, h_norm = w // gcd_val, h // gcd_val
 
-    # 查 common sizes
     if (w_norm, h_norm) in COMMON_SIZES:
         return COMMON_SIZES[(w_norm, h_norm)]
 
-    # 倒推: 短边从 1024 开始,长边按比例算,÷16 round
+    short = _round_to_multiple_of_16(target_short)
     if w >= h:
-        short = 1024
         long_edge = _round_to_multiple_of_16(int(short * w / h))
         return f"{long_edge}x{short}"
     else:
-        short = 1024
         long_edge = _round_to_multiple_of_16(int(short * h / w))
         return f"{short}x{long_edge}"
 

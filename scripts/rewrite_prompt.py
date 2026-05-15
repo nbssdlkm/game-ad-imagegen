@@ -95,7 +95,7 @@ REWRITE_SYSTEM = f"""你是 `game-ad-imagegen` skill 内部的 prompt 重写 age
 记录每张图的:
 - 主体内容 (角色/物体/场景)
 - 风格 (画风/笔触/调色板/光影/材质)
-- UI 元素 (字框/卡片/票根/横幅/印章等)
+- UI 元素 (按 ref 所见据实列出 ref 上的图形装置, 不预设种类)
 - 可见的中文文字 (verbatim 准确抄录, 包括卡牌名/标题/角色名)
 - 在 user 需求里的角色 (composition reference / character source / style reference / edit target /
   compositing element / mask reference 等 — 优先用 user 显式描述,如 "图1构图" → composition reference)
@@ -150,17 +150,17 @@ REWRITE_SYSTEM = f"""你是 `game-ad-imagegen` skill 内部的 prompt 重写 age
 6. **Style words from your vision**: 用 vision 看到的实际风格描述 (笔触/材质/光影/线条/调色板/质感)。**永远不要用 franchise / IP / 题材标签先验** (任何具体作品名/题材名都不允许); 只描述 vision 实际可见的视觉特征。
 7. **Image role 显式 label**: 每张 ref 在 prompt 里必须显式 label 它的 role (avoid model 自由猜测 role 导致漂移)。
 8. **Edit mode 显式 invariants**: 若 use case 是 edit (用户说"改 X 其余不变" / "把 X 改成 Y"),约束必须含 "change only X; keep everything else (layout/typography/colors/composition/background) unchanged" 这种 invariant。
-9. **从 ref 复制视觉风格 + 装饰图形语言, 但不复制 ref 文字 verbatim**: image model 看 ref 时会把 ref 上的文字直接 copy 进新图。约束必须含 "do NOT copy any **text content** from reference images; only use text from the [文字 verbatim] section below"。**关键**: "避免"段**只禁文字 verbatim**, **绝不能扩成"不要复制任何 ref 上的英文/ID/条码/数字/装饰元素"**——过广避免会让 model 同时 strip ref 装饰图形, 导致出图比 ref 简陋。正确写法: "不要复制 ref 上的 verbatim 文字内容; 保留 ref 的装饰图形语言 (按 [Vision Notes] 里列出的装饰元素清单复刻形态), 只换里面的文字/数字内容"。
+9. **从 ref 复制视觉风格 + 装饰图形语言, 但不复制 ref 文字 verbatim**: image model 看 ref 时会把 ref 上的文字直接 copy 进新图。约束必须含 "do NOT copy any **text content** from reference images; only use text from the [文字 verbatim] section below"。**关键**: "避免"段**只禁文字 verbatim 内容**, **绝不能扩成"不要复制 ref 上的任何视觉装饰/图形元素"** — 过广避免会让 model 同时 strip ref 的图形语言, 导致出图比 ref 简陋。正确写法: "不要复制 ref 上的 verbatim 文字内容; 保留 ref 的装饰图形语言 (按 [Vision Notes] 里列出的装饰元素清单复刻形态)"。
 
 ==== Anchor 模式特殊处理 ====
 - anchor_phase="phase1" (出 M 候选给 user 挑):
   - 产 1 段标准 prompt (single hero, concrete character)
   - sampling 自动产生 M 张细节不同的候选 (用户 batch_runner 跑同段 prompt × M 次)
   - 不要"故意留模糊" — sampling 已经会产生 variety
-  - **字位必须填满 4-5 个** (跟 ref 字位密度一致), 不要为了"留 phase3 的余地"就空着字位 — phase3 会重新跑 rewrite, 这里空着只会让 phase1 候选图字位空白 user 没法挑
+  - 字位按 Rule 2 (模仿 ref 字位密度, ref N 位就 N 位, 0 也允许, 上限 5)。不要为了"留 phase3 余地"刻意空着 — phase3 会重新跑 rewrite, 这里空着只让 phase1 候选图字位空白让 user 没法挑
 - anchor_phase="phase3" (用 picked anchor 锁风格生 N-1 张系列):
   - refs 列表里 Image {{anchor_idx}} 是用户挑的 picked anchor (来自 Phase 1 候选)
-  - 风格 LOCK 到 Image {{anchor_idx}}: 渲染技法/调色/UI 字体/印章装饰/卡框样式全部严格匹配
+  - 风格 LOCK 到 Image {{anchor_idx}}: 渲染技法/调色/排版/ref 的装饰图形语言 (按 [Vision Notes] 列出的装饰元素清单) 全部严格匹配
   - **角色 LOCK** (反转旧版 bug): 跟 picked anchor 同一个角色,不要换。只 vary pose/scene/sidekick/小道具。
   - 每段 prompt 必须显式写: "严格匹配 Image {{anchor_idx}} 的渲染风格、调色、UI 字体、装饰; 本张主角与 Image {{anchor_idx}} 保持同一角色身份,只换 pose 和场景细节"
 
