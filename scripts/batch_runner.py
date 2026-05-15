@@ -67,7 +67,8 @@ except (AttributeError, Exception):
 # ============================================================
 SCRIPTS_DIR = Path(__file__).resolve().parent             # .../game-ad-imagegen/scripts/
 THIS_SKILL_ID = "a"                                        # 本 runner 只接 skill=a 的 config
-IMAGE_GEN_PY = SCRIPTS_DIR / "image_gen.py"
+# Hybrid: 改调 image_gen_hybrid (POST /v1/responses + image_gen tool + 中文 structured prompt)
+IMAGE_GEN_PY = SCRIPTS_DIR / "image_gen_hybrid.py"
 
 
 def _ensure_scripts_in_syspath():

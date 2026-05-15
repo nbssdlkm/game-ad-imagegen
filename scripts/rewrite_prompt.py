@@ -1,138 +1,202 @@
 #!/usr/bin/env python
 """
-game-ad-imagegen / rewrite_prompt.py — vision + rewrite 模块（多段 prompt 版）
-============================================================================
+rewrite_prompt.py (hybrid worktree v2) — LLM-driven 转写层,**输出中文 structured prompt**
 
-把"用户中文需求 + 参考图"→ N 段独立英文 image-gen prompt（每段对应 1 张图，不同角色 / 不同 pose）。
-由 batch_runner.py 内部调用让 Mode 2 (form / 跑批) 也享受 skill 的核心 rewrite 能力。
+跟 main 版区别:
+  - main 版: 输出英文长段 prompt → 给 gpt-image-2 /v1/images/edits
+  - hybrid 版: 输出**中文** structured prompt (codex prompting "labeled lines" 模板) → 给 /v1/responses + image_gen tool
 
-调用方式:
-  CLI:
-    python rewrite_prompt.py --user-prompt-file in.txt --refs r1.png,r2.jpg --out rewritten.txt --n 5
+为什么不英文化:
+  - 英文化是 lossy 包装(几何细节抽象成"tilted"丢方向 — 实测 case_08 票根方向漂移根因)
+  - /v1/responses + image_gen tool 内部 vision 是多模态,中文 prompt 它能直接处理
+  - 中文 verbatim 文字也不需要翻译
 
-  模块:
-    from rewrite_prompt import rewrite
-    prompts = rewrite(user_prompt="...中文...", reference_images=[Path("r1.png"), ...], n=5)
-    # prompts is list[str] of length n
+保留 main 版的核心机制:
+  - STEP A: vision verify (hybrid 改为强制输出 [Vision Notes] 块, 反 hallucination)
+  - STEP B: CandidatePool 选角 (N>1 时产 series variety 的关键)
+  - STEP C: 产 N 段 self-contained prompt
+  - Rule 2: 文字位数 ≤5 + 模仿 ref 字位密度 (ref 无文字则不渲染)
+  - Rule 4: Verbatim
+  - Rule 6: Style words from vision, never genre/franchise/IP 先验
+  - SENTINEL 防野调用
 
-内部: ephone /v1/chat/completions(OpenAI SDK + base_url redirect)，多模态(image_url base64)。
+反转 main 版的 bug:
+  - Phase 3 ANCHOR LOCK MODE 旧版鼓励"角色 vary",hybrid 改"角色 LOCK(从 picked anchor 复制),只 vary pose/scene"
+
+CLI:
+  python rewrite_prompt.py --user-prompt-file in.txt --refs r1.png,r2.png --out rewritten.txt --n 5
+  python rewrite_prompt.py --user-prompt-file in.txt --refs r1.png,r2.png,picked_anchor.png --out rewritten.txt --n 4 --anchor-phase phase3 --anchor-idx 3
 """
 import argparse
 import base64
+import os
 import sys
 from pathlib import Path
 
 from openai import OpenAI
 
-sys.path.insert(0, str(Path(__file__).parent))
-from _config import DEFAULT_LM_MODEL, DEFAULT_TIMEOUT_SEC, load_credentials
-
-
-# n>1 时各段之间的分隔符。LLM 必须在独立行上输出此标记。
 PROMPT_SEP = "---PROMPT-SEP---"
+SENTINEL = "# REWRITTEN-CN-V2"  # 跟 main 版 REWRITTEN-V1 区分
 
-# Proof-of-origin marker prepended to every rewritten prompt. image_gen.py
-# verifies this marker before sending the prompt to the image API — any prompt
-# lacking the marker is refused (caller must run rewrite_prompt.py first).
-# image_gen.py strips this line after verification so it does not reach the model.
-SENTINEL = "# REWRITTEN-V1"
+DEFAULT_MODEL = os.environ.get("REWRITE_MODEL", "gpt-5.4")
+DEFAULT_TIMEOUT = 180
 
 
-def _wrap_with_sentinel(prompt: str) -> str:
-    """Prefix the rewritten prompt with the SENTINEL marker line."""
-    return f"{SENTINEL}\n{prompt.strip()}"
+def _load_credentials() -> tuple[str, str]:
+    key = os.environ.get("EPHONE_API_KEY")
+    if not key:
+        raise SystemExit(
+            "EPHONE_API_KEY 未设置。请在系统 env 配置:\n"
+            "  Windows: setx EPHONE_API_KEY \"sk-...\"  (重开终端生效)\n"
+            "  Linux/Mac: export EPHONE_API_KEY=\"sk-...\""
+        )
+    base = os.environ.get("EPHONE_BASE_URL", "https://api.ephone.ai")
+    if not base.endswith("/v1"):
+        base = base.rstrip("/") + "/v1"
+    return base, key
 
 
-REWRITE_SYSTEM = f"""You are the prompt-rewriting agent inside the `game-ad-imagegen` skill.
+REWRITE_SYSTEM = f"""你是 `game-ad-imagegen` skill 内部的 prompt 重写 agent。
 
-USER GIVES YOU:
-- One or more reference images, numbered Image 1, Image 2, ... in the order provided
-- A Chinese natural-language request describing the desired output
-- A target count N (how many independent image-gen prompts to produce)
+==== 输入 ====
+- 一组参考图 (按顺序编号 Image 1, Image 2, ...)
+- 一段用户的中文需求
+- 目标段数 N (要产几段独立的图像生成 prompt)
+- 可选 anchor 模式标志 (phase1 / phase3)
 
-YOUR JOB: produce **N detailed English image-generation prompts**, one per output image.
-Each prompt is sent verbatim to gpt-image-2 (/v1/images/edits) as a separate API call —
-they do NOT share state, so each prompt must be self-contained.
+==== 你的工作 ====
+产出 **N 段中文 structured prompt**,每段对应 1 张输出图。每段 prompt 独立 self-contained
+(它们会被分别送到 /v1/responses + image_generation tool, 不共享上下文)。
 
-== STEP A: Vision verify each image (silently) ==
-For each input image, internally note:
-- key_visuals (subject, pose, composition, UI elements, visible Chinese text verbatim)
-- style_summary (rendering style, palette, mood)
-- role in the request (composition anchor / character source / UI template / text-edit target / etc.) — infer from content + user's wording (e.g. "图1 = 构图参考" → "Image 1 is composition anchor")
+==== STEP A: 强制 vision verify 每张图 (不再静默) ====
+**这是反 hallucination 的最关键步骤** — 在每段 prompt 顶部强制输出 `[Vision Notes]` 块,
+每张图 plain 描述 1-3 行,**绝不能基于 franchise / game / 角色名 先验编造**。
 
-== STEP B: Build a CandidatePool of characters ==
-Scan all input images for available characters. Pick which to feature (typically N different characters if N>1 to give series variety; or N variations of one character if user asks for character study). Lean toward **N different characters** unless the user is clearly asking for the same character N ways.
-
-== STEP C: Write N independent prompts ==
-For each prompt use this skeleton:
+写法 (必须在 [Vision Notes] 块内出现, 不能跳过):
 
 ```
-Create a polished {{orientation}} {{asset type}} in {{WxH}}, aspect ratio {{ratio}}.
-Image 1 (<role>): <what Image 1 actually shows>.
-Image 2 (<role>): <what Image 2 actually shows>.
-{{... one line per reference image ...}}
-
-Design a brand-new composition echoing the style anchor image's visual language while
-adapting to {{orientation/ratio}}. Keep about 70% faithful, 30% creative.
-
-Main content requirements:
-- <Central hero: visual description + pose, traced to specific input image>
-- <Background: atmosphere + key props>
-- Large stylized title at top: "<verbatim Chinese title>"
-- Main promotional banner: "<verbatim Chinese promo line>"
-- <Optional speech bubble OR small inset stamp>: "<verbatim Chinese>"
-
-Quality and style requirements:
-- All Chinese text rendered crisply and readably DIRECTLY in the image.
-- Do NOT leave any text container blank / use placeholder pseudo-Chinese / use English subtitles.
-- No raw screenshot artifacts / phone UI / FPS overlay / watermarks / app-store badges / blank text containers.
-- <Polished commercial finish, style notes>.
-- {{Orientation}} composition only, {{WxH}}.
+[Vision Notes]
+- Image 1: <plain 描述 — 性别/年龄/发色/发型/服装颜色与款式/武器具体形状/可见装饰/可见文字 verbatim>
+- Image 2: <同上, 不基于训练先验, 看到啥写啥>
+- ...
+[/Vision Notes]
 ```
 
-== CRITICAL RULES ==
-1. **Single hero focus per prompt**: 1 main character + ≤2 supporting elements (inset / sidekick). NEVER write multi-panel / split-screen / N-grid / collage in a single prompt.
-2. **STRICTLY 4-5 Chinese text positions per prompt, NEVER MORE THAN 5**. Pick from: large title, main promotional banner, character nameplate, speech bubble, small stamp/tag, fine-print. Fewer than 4 = empty-looking; more than 5 = dilutes gpt-image-2 text rendering budget (visible failure mode in case_24). Be aggressive about cutting — when in doubt, drop a text position.
-3. **Strip batch-control language from user's Chinese**: words like "分别"/"5张"/"做N张"/"each" are NOT visual instructions — they tell you how many independent prompts to produce. Do NOT echo them into any prompt.
-4. **Verbatim Chinese**: every text position must specify either (a) the exact Chinese characters in double-quotes, OR (b) explicit "leave this position empty / no text here". Never leave a position unspecified — gpt-image-2 will hallucinate generic Chinese.
-5. **Series variety when N>1**: each of the N prompts should feature a different primary character (drawn from CandidatePool) OR a clearly different pose / scene. Avoid producing N prompts that read like minor variations of the same character.
-6. **Style words from your vision** (e.g. `polished 2D illustration`, `semi-realistic painterly CG`) — never from genre stereotypes / franchise priors.
+**反 hallucination 规则 (强 enforce, 题材无关)**:
+1. 看到角色辨不出具体身份 → 写 "<体型/性别>, <实际服装颜色与造型>" — **绝不可凭训练先验猜任何具体历史人物/franchise/动漫/游戏角色名**, 除非:
+   - (a) 图上有清晰可读的角色名字标签, 你能 OCR 出来 verbatim, 或
+   - (b) user 在原 prompt 显式指定了角色名
+2. 角色身份识别**只能基于 OCR'd 文字标签 / 名牌 / 标识**, **不能基于服装颜色/发型/武器形状/胡须长短等视觉特征推理具体身份** (这是题材刻板印象, 会把同 trope 的 N 张图都识别成同一角色)
+3. 候选角色池中**只能引用 vision 真实可见 + OCR 确认**的身份, 池子小就池子小, **绝不允许扩充 hallucinated 角色**
+4. 如果实在不确定, 用 "<视觉特征>+<placeholder>" 描述 (如 "绿色服装+持长柄武器+长发的男性角色"), **绝不要把名字写进去**
 
-== OUTPUT FORMAT ==
-- If N == 1: output ONLY the single English prompt as plain text. No preamble, no markdown fences.
-- If N >= 2: output N prompts separated by a line containing exactly `{PROMPT_SEP}` (no other characters on that line). Example for N=3:
+下游 prompt 中**所有"参考图角色"段必须基于 [Vision Notes] 推导**, 不能引入 [Vision Notes] 没提到的细节。
 
+记录每张图的:
+- 主体内容 (角色/物体/场景)
+- 风格 (画风/笔触/调色板/光影/材质)
+- UI 元素 (字框/卡片/票根/横幅/印章等)
+- 可见的中文文字 (verbatim 准确抄录, 包括卡牌名/标题/角色名)
+- 在 user 需求里的角色 (composition reference / character source / style reference / edit target /
+  compositing element / mask reference 等 — 优先用 user 显式描述,如 "图1构图" → composition reference)
+- **装饰元素细颗粒 (必须单独列, 不算文字位)**: ref 上所有**非文字图形装饰**——按 ref 所见据实列出, 不预设种类。任何 ref 上的图形特征 (形状/重复 motif/边框/标记/光效/材质/线条/纹理细节/构图装置 等) 都属于此类。这些是 ref 的**视觉装饰语言**, 跟文字位分开, 必须列出来让下游 image_gen 复刻图形语言 (内容可以换但形态保留)。
+
+==== STEP B: 构建 CandidatePool ====
+扫描所有 refs 里可用的角色/主体:
+- N=1 时: 选 1 个最 fit user 意图的角色当主角
+- N>=2 时:
+  - 默认 "N 个不同主角" (各 ref 各 1 个,产生 series variety) — 除非 user 明显在要求"5 张全 X 角色"或单角色多 pose
+  - anchor_phase=phase3 时: **角色严格 LOCK** (从 picked_anchor 复制角色身份),只 vary pose/scene/sidekick
+    - 此规则反转旧版"angle/sidekick may vary"导致主角身份跨张漂移的问题
+
+==== STEP C: 产 N 段中文 structured prompt ====
+**每段 prompt 必须以 `[Vision Notes]` 块开头** (STEP A 输出), 然后才是 labeled-lines 模板:
+
+```
+[Vision Notes]
+- Image 1: ...
+- Image 2: ...
+[/Vision Notes]
+
+用途: <一句话本图的功能用途, 自由文本, 如 ads/key-visual/concept-art/character-portrait/scene-painting/photoreal/text-localization-edit/ui-mockup 等, 不限于这些>
+主要请求: <一句话讲这张图要什么>
+参考图角色:
+  - Image 1 (<role>): <vision 看到的 + 在本段 prompt 怎么用>
+  - Image 2 (<role>): <同上>
+  - ...
+场景/背景: <氛围 + 关键 props + 来源>
+主角主体: <具体描述 + pose + 跟 ref 的关系>
+画风/介质: <从 vision 提取的风格描述 (笔触/材质/光影/线条/调色板/质感), 不写任何 franchise/IP/题材名>
+构图/比例/尺寸: <横/竖版 + 宽高比 + 尺寸 + 留白>
+文字 (verbatim, 字位数模仿 ref 字位密度, 上限 5; ref 无文字则本段省略):
+  - <位置 1>: "<引号内 exact verbatim>"
+  - <位置 2>: "<...>"
+  - ... (≤5 个; 没有的位置直接不写出来)
+约束: <从 user 否定指令转成正向 + 通用 quality 约束>
+避免: <hallucination 黑名单: 不要拼图 / 不要 panel / 不要从 ref 复制其他文字 / ...>
+```
+
+==== 关键规则 (严格 enforce) ====
+1. **单主角单 panel**: 1 主角 + ≤2 supporting elements。绝不写 multi-panel / split-screen / 拼图。
+2. **文字位数量 = 模仿 ref 字位密度**: image model 在 ≥6 文字位时文字渲染塌,所以**上限 5 个文字位**。下限 = ref 实际字位数 (ref 几位就几位, 0 位也允许,意思整图不渲染任何文字)。两条规则:
+   - **不要无中生有加字位**: ref 是无文字 splash / concept art / 纯视觉 KV → 输出也不加文字, 哪怕 user prompt 提到"宣传语",也只放到 user 显式指定的一个字位 (没就空)
+   - **字位密度高的 ref 也别超 5**: ref 上有 8-10 字位的密集广告 → 输出截到 ≤5 个最关键字位 (优先 user 显式指定的 > ref 主标题 > ref 次标题, 其他略)
+  每个保留字位填什么:
+   - (a) user 显式指定的字 (`宣传语="..."` / 标题 / 副标语) → verbatim
+   - (b) ref 上有字位但 user 没指定内容 → 按 ref 字位的**语义角色**填 user 主角对应内容 (ref 那位置原是角色名 → user 主角名; ref 那位置原是定位/技能 → user 主角对应定位; ref 那位置原是品类 slogan → 保留性质微调)
+3. **删 user prompt 的批量控制语言**: "分别" / "5 张" / "做 N 张" / "分两排" 这些不是视觉指令,是告诉你产几段。**不要 echo 进任何 prompt**。
+4. **Verbatim**: 每个文字位的内容写引号内 exact verbatim (中文/英文/数字皆可)。永远不要含糊地说"主题文字"/"slogan 类的文案" — 会被 image model hallucinate。如果某位置 ref 上没字, 该位置直接**不写进 [文字] 段**即可 (不需要写"留空")。
+5. **Series variety when N>1 (非 anchor phase3)**: 每段不同 primary character (来自 CandidatePool),不要 N 段全是同一个角色的细微变体。
+6. **Style words from your vision**: 用 vision 看到的实际风格描述 (笔触/材质/光影/线条/调色板/质感)。**永远不要用 franchise / IP / 题材标签先验** (任何具体作品名/题材名都不允许); 只描述 vision 实际可见的视觉特征。
+7. **Image role 显式 label**: 每张 ref 在 prompt 里必须显式 label 它的 role (avoid model 自由猜测 role 导致漂移)。
+8. **Edit mode 显式 invariants**: 若 use case 是 edit (用户说"改 X 其余不变" / "把 X 改成 Y"),约束必须含 "change only X; keep everything else (layout/typography/colors/composition/background) unchanged" 这种 invariant。
+9. **从 ref 复制视觉风格 + 装饰图形语言, 但不复制 ref 文字 verbatim**: image model 看 ref 时会把 ref 上的文字直接 copy 进新图。约束必须含 "do NOT copy any **text content** from reference images; only use text from the [文字 verbatim] section below"。**关键**: "避免"段**只禁文字 verbatim**, **绝不能扩成"不要复制任何 ref 上的英文/ID/条码/数字/装饰元素"**——过广避免会让 model 同时 strip ref 装饰图形, 导致出图比 ref 简陋。正确写法: "不要复制 ref 上的 verbatim 文字内容; 保留 ref 的装饰图形语言 (按 [Vision Notes] 里列出的装饰元素清单复刻形态), 只换里面的文字/数字内容"。
+
+==== Anchor 模式特殊处理 ====
+- anchor_phase="phase1" (出 M 候选给 user 挑):
+  - 产 1 段标准 prompt (single hero, concrete character)
+  - sampling 自动产生 M 张细节不同的候选 (用户 batch_runner 跑同段 prompt × M 次)
+  - 不要"故意留模糊" — sampling 已经会产生 variety
+  - **字位必须填满 4-5 个** (跟 ref 字位密度一致), 不要为了"留 phase3 的余地"就空着字位 — phase3 会重新跑 rewrite, 这里空着只会让 phase1 候选图字位空白 user 没法挑
+- anchor_phase="phase3" (用 picked anchor 锁风格生 N-1 张系列):
+  - refs 列表里 Image {{anchor_idx}} 是用户挑的 picked anchor (来自 Phase 1 候选)
+  - 风格 LOCK 到 Image {{anchor_idx}}: 渲染技法/调色/UI 字体/印章装饰/卡框样式全部严格匹配
+  - **角色 LOCK** (反转旧版 bug): 跟 picked anchor 同一个角色,不要换。只 vary pose/scene/sidekick/小道具。
+  - 每段 prompt 必须显式写: "严格匹配 Image {{anchor_idx}} 的渲染风格、调色、UI 字体、装饰; 本张主角与 Image {{anchor_idx}} 保持同一角色身份,只换 pose 和场景细节"
+
+==== 输出格式 ====
+- N == 1: 直接输出 1 段中文 structured prompt (纯文本,无 markdown fence)
+- N >= 2: N 段中文 prompt,用单独一行 `{PROMPT_SEP}` 分隔。例:
   ```
-  Create a polished landscape ... (full prompt 1) ... 1920x1080.
+  用途: game-ad
+  主要请求: ...
+  ... (第 1 段完整 labeled lines)
   {PROMPT_SEP}
-  Create a polished landscape ... (full prompt 2) ... 1920x1080.
+  用途: game-ad
+  主要请求: ...
+  ... (第 2 段)
   {PROMPT_SEP}
-  Create a polished landscape ... (full prompt 3) ... 1920x1080.
+  ...
   ```
 
-NO preamble like "Here are the prompts:", NO markdown ```fences``` around individual prompts, NO numbering ("Prompt 1:"). The separator line is the only structure marker. Each prompt is sent verbatim to gpt-image-2 as-is.
+绝不要前导废话 ("Here are the prompts:")、绝不要 markdown ```fences```、绝不要编号 ("Prompt 1:")。
+分隔符那行是唯一的 structure marker。每段会被 verbatim 喂给 image_gen tool。
 """
 
 
 def _encode_image(p: Path) -> dict:
-    """把图片文件 encode 成 OpenAI chat 多模态 message 的 image_url part。"""
     with open(p, "rb") as f:
         b64 = base64.b64encode(f.read()).decode()
     ext = p.suffix.lower()
     mime = (
         "image/jpeg" if ext in (".jpg", ".jpeg") else
         "image/webp" if ext == ".webp" else
-        "image/gif" if ext == ".gif" else
         "image/png"
     )
-    return {
-        "type": "image_url",
-        "image_url": {"url": f"data:{mime};base64,{b64}"},
-    }
+    return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
 
 
 def _strip_fence(text: str) -> str:
-    """剥掉 LLM 偶尔仍包的 ```...``` fence(出现在整段 output 顶层)。"""
     text = text.strip()
     if text.startswith("```"):
         lines = text.split("\n")
@@ -143,153 +207,126 @@ def _strip_fence(text: str) -> str:
     return text
 
 
-def rewrite(user_prompt: str, reference_images, n: int = 1, model: str = None, verbose: bool = False, anchor_phase: str = None, anchor_idx: int = None) -> list:
-    """vision + rewrite。返回 list[str] of length n。
+def _wrap_with_sentinel(prompt: str) -> str:
+    return f"{SENTINEL}\n{prompt.strip()}"
 
+
+def rewrite(user_prompt: str, reference_images, n: int = 1,
+            model: str = None, verbose: bool = False,
+            anchor_phase: str = None, anchor_idx: int = None) -> list[str]:
+    """
     输入:
-      user_prompt: 用户中文需求(也可英文)
-      reference_images: list of Path or str(1+ 张参考图)
-      n: 期望输出几段独立 prompt(每段对应 1 张图)
-      model: 覆盖默认 LM model
-      verbose: 打印元信息
-      anchor_phase: None (默认,标准 multi-segment mode)
-                    "phase1" (anchor workflow Phase 1: 出 M 候选给用户挑;
-                              系统层面等同 n=1 标准 rewrite,但 batch_runner 会用这同一段
-                              prompt 跑 M 次 sampling 出 M 张候选)
-                    "phase3" (anchor workflow Phase 3: reference_images 列表**最后一张**
-                              是用户在 Phase 2 挑选的 anchor png,LLM 必须严格锁定 anchor
-                              的画风/UI/调色/字体作为系列锚,N-1 段 prompt 每段不同主体角色
-                              但视觉风格 ~85% faithful to anchor)
+      user_prompt: 用户中文 (可含 prompt_zh.md header,内部自动 strip)
+      reference_images: list of Path
+      n: 期望输出段数
+      anchor_phase: None / "phase1" / "phase3"
+      anchor_idx: phase3 时指定 picked anchor 在 refs 里的 1-indexed idx (默认最后一张)
 
-    返回:
-      list[str]:
-        - n=1: 长度 1 的 list
-        - n>=2: 长度 n 的 list,每段独立 self-contained prompt(不同角色 / pose)
-        - 如果 LLM 没返回足够段数,fallback 复用最后一段填到 n 个
-
-    特性:
-      - 一次 LLM 调用产 N 段(省 vision token)
-      - 系列多样性:每段尽量不同角色(rule 5)
-      - text 位置严约束:≤5 个/段(rule 2)
-      - anchor_phase="phase3" 时强制锁 anchor 风格,避免 N 张系列画风漂
+    输出:
+      list[str] 长度 n,每段含 SENTINEL header
     """
     if n < 1:
         raise ValueError(f"n must be >= 1, got {n}")
 
-    base_url, api_key = load_credentials()
-    client = OpenAI(api_key=api_key, base_url=base_url, timeout=DEFAULT_TIMEOUT_SEC)
+    # Strip prompt_zh.md metadata header
+    if "---" in user_prompt:
+        user_prompt = user_prompt.split("---", 1)[-1].strip()
 
-    model = model or DEFAULT_LM_MODEL
+    base_url, api_key = _load_credentials()
+    client = OpenAI(api_key=api_key, base_url=base_url, timeout=DEFAULT_TIMEOUT)
+    model = model or DEFAULT_MODEL
     ref_paths = [Path(p) for p in reference_images]
-
     image_contents = [_encode_image(p) for p in ref_paths]
 
-    # 用户消息附加 N 的说明 + 强调多样性
     user_text = user_prompt
     if n > 1:
         user_text += (
-            f"\n\n[runner instruction] Produce {n} independent prompts (one per output image), "
-            f"separated by `{PROMPT_SEP}` on its own line. Each prompt should feature a DIFFERENT "
-            f"primary character drawn from the input images so the {n}-image series gives visual "
-            f"variety. Strip any '分别' / '{n} 张' counting words from the input — those tell you "
-            f"how many prompts to make, not what to render."
+            f"\n\n[runner 指令] 产出 {n} 段独立的中文 structured prompt (每段对应 1 张输出图),"
+            f"用单独一行 `{PROMPT_SEP}` 分隔。每段要 feature 不同的 primary character "
+            f"(从 CandidatePool 选),非 anchor phase3 模式下要给 series 视觉 variety。"
+            f"从 user 输入中删除批量控制词 ('分别' / '{n} 张' 等)。"
         )
     else:
-        user_text += f"\n\n[runner instruction] Produce 1 prompt (single output image)."
+        user_text += "\n\n[runner 指令] 产出 1 段中文 structured prompt (单张输出)。"
 
-    # Anchor workflow Phase 3: caller 指定 anchor_idx (或默认最后一张) — caller 必须保证该 idx 处是 picked anchor
-    if anchor_phase == "phase3" and len(ref_paths) >= 1:
-        # caller 显式传 anchor_idx 时用 caller 的;不传则默认最后一张(向后兼容)
+    if anchor_phase == "phase1":
+        user_text += (
+            "\n\n[ANCHOR CANDIDATE MODE — Phase 1] 这段 prompt 将被用于产 M 张候选 "
+            "(同段 prompt × M sampling),让 user 挑出最满意的作为后续 Phase 3 系列的视觉 anchor。"
+            "写 1 段精心打磨的中文 prompt,明确角色选定 (不要故意模糊 — sampling 会自然提供 pose/细节 variety)。"
+        )
+    elif anchor_phase == "phase3":
         if anchor_idx is None:
             anchor_idx = len(ref_paths)
         if anchor_idx < 1 or anchor_idx > len(ref_paths):
             raise ValueError(f"anchor_idx={anchor_idx} 超出 refs 范围 1..{len(ref_paths)}")
         user_text += (
-            f"\n\n[ANCHOR LOCK MODE — Phase 3] Image {anchor_idx} (out of {len(ref_paths)} ref images) is the "
-            f"user-picked **anchor image** from a Phase 1 candidate round. It represents the LOCKED "
-            f"visual style for this entire series — rendering technique, color palette, lighting, UI "
-            f"layout, typography, composition language. Your {n} prompts MUST visually echo Image "
-            f"{anchor_idx}'s style very tightly (**~85% faithful to anchor instead of the usual 70%**) "
-            f"— only the primary character identity / pose / sidekick may vary across prompts. "
-            f"All other reference images (not Image {anchor_idx}) provide character source material as before. "
-            f"In each prompt, **explicitly write** at the end: "
-            f"`Strictly match Image {anchor_idx}'s rendering style, palette, UI plate styling, and typography.` "
-            f"The final output series (picked anchor + {n} new images) should look like one coherent "
-            f"set, not {n+1} unrelated images."
-        )
-    elif anchor_phase == "phase1":
-        # Phase 1 = 出 M 候选给用户挑;让 LLM 写一段标准 prompt (single hero),
-        # batch_runner 用同段 prompt 跑 M 次 sampling 自然出 M 张候选(细节不同)
-        user_text += (
-            f"\n\n[ANCHOR CANDIDATE MODE — Phase 1] This prompt will be used to generate M candidate "
-            f"variants (same prompt × M sampling), letting the user pick the best one as anchor for "
-            f"a subsequent Phase 3 series. Write a single well-crafted prompt with concrete character "
-            f"choice (don't artificially leave it vague — sampling will provide pose/detail variety)."
+            f"\n\n[ANCHOR LOCK MODE — Phase 3] Image {anchor_idx} 是用户在 Phase 1 候选轮挑的 "
+            f"**picked anchor 图**,它代表本 series 整体的 LOCKED 视觉风格 — 渲染技法/调色/UI 字体/装饰/卡框样式。"
+            f"你的 {n} 段 prompt 必须视觉风格严格匹配 Image {anchor_idx} (**~85% faithful 而不是普通 70%**)。"
+            f"**角色身份 LOCK** (反转旧版 bug — 不允许角色 vary): {n} 段 prompt 的主角都跟 Image {anchor_idx} "
+            f"同一个角色,只 vary pose/scene/sidekick/小道具。其他 ref (Image ≠ {anchor_idx}) "
+            f"提供额外 character/scene material 但不要改变主角身份。"
+            f"每段 prompt 的 [约束] 部分必须显式写: "
+            f"`严格匹配 Image {anchor_idx} 的渲染风格/调色/UI 字体/装饰; 本张主角与 Image {anchor_idx} 保持同一角色身份`。"
+            f"最终系列 (picked anchor + {n} 张新图) 应该看起来像 coherent set,而不是 {n+1} 张不相关的图。"
         )
 
     user_content = image_contents + [{"type": "text", "text": user_text}]
 
     if verbose:
-        print(f"  [rewrite] model={model}  refs={len(ref_paths)}  n={n}  user_prompt_chars={len(user_prompt)}", flush=True)
+        print(f"  [rewrite-cn] model={model} refs={len(ref_paths)} n={n} phase={anchor_phase} anchor_idx={anchor_idx}", flush=True)
 
-    # reasoning_effort="high" 让 gpt-5.4 系列开思考模式提升 rewrite 质量;
-    # 模型 / 代理不支持该参数(旧模型 / 非 reasoning model / ephone 透传配置缺失)时
-    # 自动 fallback 到默认调用,保证向后兼容。其他错误(quota / network / 401 等)原样 raise。
-    _msgs = [
+    msgs = [
         {"role": "system", "content": REWRITE_SYSTEM},
         {"role": "user", "content": user_content},
     ]
     try:
         response = client.chat.completions.create(
-            model=model, messages=_msgs, extra_body={"reasoning_effort": "high"},
+            model=model, messages=msgs, extra_body={"reasoning_effort": "medium"},
         )
-    except Exception as _e:
-        _emsg = str(_e).lower()
-        _unsupported = "reasoning" in _emsg and any(
-            s in _emsg for s in ("unknown", "unsupported", "invalid", "bad request", "400")
-        )
-        if not _unsupported:
+    except Exception as e:
+        emsg = str(e).lower()
+        if "reasoning" in emsg and any(s in emsg for s in ("unknown", "unsupported", "invalid", "400")):
+            print(f"  [rewrite-cn] WARN: model={model} 不支持 reasoning_effort, fallback default", file=sys.stderr, flush=True)
+            response = client.chat.completions.create(model=model, messages=msgs)
+        else:
             raise
-        print(f"  [rewrite] WARN: model={model} rejects reasoning_effort='high'; retrying without it", file=sys.stderr, flush=True)
-        response = client.chat.completions.create(model=model, messages=_msgs)
+
     text = _strip_fence(response.choices[0].message.content or "")
 
     if n == 1:
         if not text:
-            raise RuntimeError("rewrite LLM returned empty output for n=1")
+            raise RuntimeError("rewrite-cn LLM 返回空")
         return [_wrap_with_sentinel(text)]
 
-    # n>=2: 用 PROMPT_SEP 拆。容忍 leading/trailing whitespace + 可能的 "Prompt 1:" prefix
     raw_parts = [p.strip() for p in text.split(PROMPT_SEP)]
     parts = [_strip_fence(p) for p in raw_parts if p.strip()]
 
-    # Invariant: rewrite 输出必须能拆出 ≥1 段。空 / 无 SEP → raise(不 fallback 到原中文)。
     if len(parts) == 0:
         snippet = (text[:200] + "...") if text else "(empty)"
-        raise RuntimeError(
-            f"rewrite LLM produced unparseable output (no PROMPT_SEP for n={n}>=2): {snippet!r}"
-        )
+        raise RuntimeError(f"rewrite-cn 无法 parse (n={n}>=2 但没找到 PROMPT_SEP): {snippet!r}")
 
     if len(parts) < n:
-        print(f"  [rewrite] WARN: expected {n} prompts, got {len(parts)}; padding with last", file=sys.stderr, flush=True)
+        print(f"  [rewrite-cn] WARN: 期望 {n} 段, 得 {len(parts)} 段, 用最后一段 pad", file=sys.stderr, flush=True)
         while len(parts) < n:
             parts.append(parts[-1])
     elif len(parts) > n:
-        print(f"  [rewrite] WARN: expected {n} prompts, got {len(parts)}; truncating", file=sys.stderr, flush=True)
+        print(f"  [rewrite-cn] WARN: 期望 {n} 段, 得 {len(parts)} 段, 截断", file=sys.stderr, flush=True)
         parts = parts[:n]
 
     return [_wrap_with_sentinel(p) for p in parts]
 
 
 def main():
-    ap = argparse.ArgumentParser(description="rewrite 中文需求 + 参考图 → N 段英文 image-gen prompt")
-    ap.add_argument("--user-prompt-file", required=True, help="中文需求 prompt 文件")
-    ap.add_argument("--refs", required=True, help="comma-separated reference image paths (1+ 张)")
-    ap.add_argument("--out", required=True, help="输出文件(N 段用 `---PROMPT-SEP---` 分隔)")
-    ap.add_argument("--n", type=int, default=1, help="期望输出几段独立 prompt(默认 1)")
-    ap.add_argument("--model", default=None, help=f"override LM model (default: {DEFAULT_LM_MODEL})")
-    ap.add_argument("--anchor-phase", default=None, choices=[None, "phase1", "phase3"],
-                    help="anchor workflow mode: phase1 (候选生成) / phase3 (anchor 锁风格,refs 最后一张是 picked anchor)")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--user-prompt-file", required=True)
+    ap.add_argument("--refs", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--n", type=int, default=1)
+    ap.add_argument("--model", default=None)
+    ap.add_argument("--anchor-phase", default=None, choices=[None, "phase1", "phase3"])
+    ap.add_argument("--anchor-idx", type=int, default=None)
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -297,24 +334,26 @@ def main():
     refs = [Path(p) for p in args.refs.split(",")]
     for p in refs:
         if not p.exists():
-            print(f"! ref image not found: {p}", file=sys.stderr)
+            print(f"! ref not found: {p}", file=sys.stderr)
             return 2
 
     try:
-        prompts = rewrite(user_prompt, refs, n=args.n, model=args.model, verbose=args.verbose, anchor_phase=args.anchor_phase)
+        prompts = rewrite(user_prompt, refs, n=args.n, model=args.model,
+                          verbose=args.verbose, anchor_phase=args.anchor_phase,
+                          anchor_idx=args.anchor_idx)
     except Exception as e:
-        print(f"! rewrite failed: {type(e).__name__}: {e}", file=sys.stderr)
+        print(f"! rewrite-cn failed: {type(e).__name__}: {e}", file=sys.stderr)
         return 1
 
     out_text = (f"\n{PROMPT_SEP}\n").join(prompts) if args.n > 1 else prompts[0]
     Path(args.out).write_text(out_text, encoding="utf-8")
-    print(f"OK: wrote {args.out} ({len(out_text)} chars, {len(prompts)} prompts)")
+    print(f"OK: {args.out} ({len(out_text)} chars, {len(prompts)} 段)")
     if args.verbose:
         for i, p in enumerate(prompts, 1):
-            print(f"--- prompt {i}/{len(prompts)} (first 200 chars) ---")
-            print(p[:200])
+            print(f"--- 段 {i}/{len(prompts)} (前 300 字) ---")
+            print(p[:300])
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main() or 0)
+    sys.exit(main())
