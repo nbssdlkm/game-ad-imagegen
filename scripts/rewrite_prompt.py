@@ -42,7 +42,7 @@ DEFAULT_MODEL = os.environ.get("REWRITE_MODEL", "gpt-5.4")
 DEFAULT_TIMEOUT = 180
 
 
-from _credentials import load_credentials as _load_credentials  # noqa: E402
+from _credentials import load_credentials as _load_credentials, CredentialsError  # noqa: E402
 
 
 REWRITE_SYSTEM = f"""你是 `game-ad-imagegen` skill 内部的 prompt 重写 agent。
@@ -352,6 +352,9 @@ def main():
         prompts = rewrite(user_prompt, refs, n=args.n, model=args.model,
                           verbose=args.verbose, anchor_phase=args.anchor_phase,
                           anchor_idx=args.anchor_idx)
+    except CredentialsError as e:
+        print(f"! credentials missing:\n{e}", file=sys.stderr)
+        return 2
     except Exception as e:
         print(f"! rewrite-cn failed: {type(e).__name__}: {e}", file=sys.stderr)
         return 1

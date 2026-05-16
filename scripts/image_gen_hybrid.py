@@ -38,7 +38,7 @@ from prompt_sanitize import (  # noqa: E402
     SENTINEL, validate_rewritten,
     sanitize_post_rewrite, sanitize_raw_user_prompt,
 )
-from _credentials import load_credentials as _load_credentials  # noqa: E402
+from _credentials import load_credentials as _load_credentials, CredentialsError  # noqa: E402
 
 DEFAULT_MODEL = "gpt-5.4"
 DEFAULT_REASONING = "medium"
@@ -160,7 +160,11 @@ def main():
 
     t0 = time.time()
     print(f"=> POST /responses model={args.model} refs={len(refs)} size={effective_size} quality={args.quality} reasoning={args.reasoning_effort}", flush=True)
-    res = call_responses(cleaned, refs, args.model, effective_size, args.quality, args.reasoning_effort)
+    try:
+        res = call_responses(cleaned, refs, args.model, effective_size, args.quality, args.reasoning_effort)
+    except CredentialsError as e:
+        print(f"! credentials missing:\n{e}", file=sys.stderr)
+        return 2
     elapsed = round(time.time() - t0, 1)
     print(f"<= HTTP {res['http_status']} elapsed={elapsed}s", flush=True)
 

@@ -18,6 +18,7 @@ architectural 重构: 主对话责任 = `rewrite_prompt.py` 产中文 structured
 ⚠️ 题材无关 — 所有 regex 只看 prompt 结构关键词,不预设角色/题材/风格。
 """
 import re
+from math import gcd as _gcd  # stdlib
 
 # rewriter 输出必带的 marker
 SENTINEL = "# REWRITTEN-CN-V2"
@@ -53,15 +54,21 @@ def _negate_to_positive(text: str) -> str:
     return text
 
 
-# === Size 提取 ===
+# === Size 提取 (题材无关) ===
 SIZE_PATTERNS = [
-    # "WxH" (1920x1080, 2048x1152, 650x250)
+    # "WxH" 字面 (任何形式) — 加 anchor check 跑 (见 _extract_and_normalize_size)
     (re.compile(r"\b(\d{3,4})\s*[xX×\*]\s*(\d{3,4})\b"), "explicit_wxh"),
-    # "宽高比 X:Y" / "X:Y" (9:16, 16:9) — 必须有 anchor word (避免误匹配 "技能 3:7 概率" / "标:文" 等)
-    (re.compile(r"宽高比\s*(\d{1,2})\s*[:：]\s*(\d{1,2})"), "ratio"),
-    (re.compile(r"(?:比例|宽高比|画幅|尺寸比|横纵比|aspect)\s*[:：]?\s*(\d{1,2})\s*[:：]\s*(\d{1,2})"), "ratio"),
+    # "宽高比 X:Y" / "X:Y" — 必须有 anchor word (避免误匹配 "技能 3:7 概率" / "标:文" 等)
+    (re.compile(r"宽高比\s*[:：]?\s*(\d{1,2})\s*[:：]\s*(\d{1,2})"), "ratio"),
+    (re.compile(r"(?:比例|画幅|尺寸比|横纵比|aspect)\s*[:：]?\s*(\d{1,2})\s*[:：]\s*(\d{1,2})"), "ratio"),
     (re.compile(r"(\d{1,2})\s*[:：]\s*(\d{1,2})\s*(?:版|横|竖|portrait|landscape)"), "ratio_with_anchor"),
 ]
+
+# Size 附近的 anchor 词 — WxH 匹配后必须 ±20 char 内有这些之一才采纳 (防 verbatim 文本"挑战1080x720" leak)
+_SIZE_NEARBY_ANCHORS = re.compile(
+    r"尺寸|画幅|大小|分辨率|size|resolution|输出|宽高|比例|横版|竖版|landscape|portrait|"
+    r"宽|高|配图|要|长方形|正方形|做|生成|图"
+)
 
 # 关键字 → 比例 hint
 ORIENTATION_KEYWORDS = {
@@ -109,27 +116,33 @@ def _aspect_to_size(w: int, h: int, target_short: int = 1152) -> str:
         return f"{short}x{long_edge}"
 
 
-from math import gcd as _gcd  # stdlib since 3.5; 删除自实现
+# (math.gcd 已在文件顶部 import, 旧自实现 _gcd 已删)
 
 
-def _extract_and_normalize_size(text: str) -> tuple[str | None, str, str | None]:
+def _extract_and_normalize_size(text: str) -> tuple[str | None, str, str | None, bool]:
     """
-    返回 (normalized_size, source_hint, target_size)
+    返回 (normalized_size, source_hint, target_size, upscaled)
     - normalized_size: "WxH" or None — ephone 用的 ÷16 合规 size
     - source_hint: 来源描述,用于 log
     - target_size: "WxH" or None — user 真实意图的 size (没 round 也没 upscale); 跟 normalized 不等时,
-      image_gen 写图后需要 PIL crop 居中裁切到 target_size。None 表示不需要 post-crop。
+      image_gen 写图后需要 PIL post-resize / crop 到 target_size。None 表示不需要 post-resize。
+    - upscaled: True 表示走的 upscale 分支 (sub-655K 像素), image_gen 应用 LANCZOS resize;
+      False 表示走 round 分支 (÷16 微调) 或无需 post-resize, image_gen 应用 center crop
     """
-    # Step 1: 显式 WxH 优先 (用户最明确意图)
+    # Step 1: 显式 WxH (用户最明确意图)
+    # 加 nearby anchor check: WxH ±20 char 内有 size-related 词才采纳 (防 verbatim 文本 leak)
     for m in SIZE_PATTERNS[0][0].finditer(text):
+        start, end = m.span()
+        window = text[max(0, start - 20):min(len(text), end + 20)]
+        if not _SIZE_NEARBY_ANCHORS.search(window):
+            continue  # 跳过没 anchor 的 wxh (e.g. verbatim 文案"挑战1080x720")
         w, h = int(m.group(1)), int(m.group(2))
-        target = f"{w}x{h}"  # user 真实意图
+        target = f"{w}x{h}"
         # 校验 + auto-round to 16
         w_rounded = _round_to_multiple_of_16(w)
         h_rounded = _round_to_multiple_of_16(h)
         # 校验最大边 <= 3840
         if max(w_rounded, h_rounded) > 3840:
-            # 缩到 3840 边
             if w_rounded >= h_rounded:
                 h_rounded = _round_to_multiple_of_16(int(3840 * h_rounded / w_rounded))
                 w_rounded = 3840
@@ -138,7 +151,7 @@ def _extract_and_normalize_size(text: str) -> tuple[str | None, str, str | None]
                 h_rounded = 3840
         # 校验比例 <= 3:1
         if max(w_rounded, h_rounded) / min(w_rounded, h_rounded) > 3:
-            return None, f"显式 {w}x{h} 比例 >3:1 不合规", None
+            return None, f"显式 {w}x{h} 比例 >3:1 不合规", None, False
         # 校验 total pixels >= 655360 (ephone gpt-image-2 min pixel), 不够则按比例 upscale
         total = w_rounded * h_rounded
         upscaled = False
@@ -153,27 +166,24 @@ def _extract_and_normalize_size(text: str) -> tuple[str | None, str, str | None]
             upscaled = True
         rounded = f"{w_rounded}x{h_rounded}"
         if upscaled:
-            # upscale 场景 (e.g. 650x250 banner < 655K 像素): ephone 出 rounded (e.g. 2624x1024),
-            # PIL LANCZOS resize 回 user 原 size — 保 user 真实尺寸意图
-            return rounded, f"显式 {w}x{h} 像素 < 655K → ephone 用 {rounded} → PIL resize 回 {target}", target
+            return rounded, f"显式 {w}x{h} 像素 < 655K → ephone 用 {rounded} → PIL resize 回 {target}", target, True
         if rounded != target:
-            # round 场景 (e.g. 1920x1080 → 1920x1088): ephone 出 rounded, PIL crop 居中裁切回 target
-            return rounded, f"显式 {target} → ephone 用 ÷16 合规 {rounded} → PIL crop 回 {target}", target
-        return rounded, f"显式 {target}", None
+            return rounded, f"显式 {target} → ephone 用 ÷16 合规 {rounded} → PIL crop 回 {target}", target, False
+        return rounded, f"显式 {target}", None, False
 
-    # Step 2: 宽高比 X:Y
+    # Step 2: 宽高比 X:Y (SIZE_PATTERNS[1:] 全是 ratio)
     for pat, kind in SIZE_PATTERNS[1:]:
         m = pat.search(text)
         if m:
             w, h = int(m.group(1)), int(m.group(2))
-            return _aspect_to_size(w, h), f"宽高比 {w}:{h} ({kind})", None
+            return _aspect_to_size(w, h), f"宽高比 {w}:{h} ({kind})", None, False
 
     # Step 3: 关键字
     for kw, (w, h) in ORIENTATION_KEYWORDS.items():
         if kw in text:
-            return _aspect_to_size(w, h), f"关键字 '{kw}' → {w}:{h}", None
+            return _aspect_to_size(w, h), f"关键字 '{kw}' → {w}:{h}", None, False
 
-    return None, "未提取到 size hint", None
+    return None, "未提取到 size hint", None, False
 
 
 # === Main entry: validate + sanitize ===
@@ -189,7 +199,8 @@ def sanitize_post_rewrite(prompt: str) -> tuple[str, dict]:
       - 兜底 strip 批量词 + 否定→正向
       - 提取 size hint
     """
-    info = {"sentinel_ok": False, "size": None, "size_source": None, "target_size": None, "warnings": []}
+    info = {"sentinel_ok": False, "size": None, "size_source": None, "target_size": None,
+            "upscaled": False, "warnings": []}
 
     if not validate_rewritten(prompt):
         info["warnings"].append(f"missing SENTINEL '{SENTINEL}' — 可能没经过 rewriter")
@@ -201,10 +212,11 @@ def sanitize_post_rewrite(prompt: str) -> tuple[str, dict]:
     cleaned = _strip_batch_words(prompt)
 
     # Size 提取 (从原 prompt 而非 cleaned, 避免清洗破坏数字)
-    size, source, target = _extract_and_normalize_size(prompt)
+    size, source, target, upscaled = _extract_and_normalize_size(prompt)
     info["size"] = size
     info["size_source"] = source
-    info["target_size"] = target  # 非 None 时 image_gen 需 PIL crop 居中裁切到该尺寸
+    info["target_size"] = target  # 非 None 时 image_gen 需 post-resize 到该尺寸
+    info["upscaled"] = upscaled  # True 走 LANCZOS resize; False 走 center crop (或无 post-resize)
 
     return cleaned, info
 
@@ -219,22 +231,23 @@ def sanitize_raw_user_prompt(prompt: str) -> tuple[str, dict]:
         "size": None,
         "size_source": None,
         "target_size": None,
+        "upscaled": False,
         "warnings": ["called sanitize_raw_user_prompt - rewriter should be used instead for full pipeline"],
     }
 
-    # Strip md header
-    if "---" in prompt:
-        s = prompt.split("---", 1)[-1].strip()
-    else:
-        s = prompt.strip()
+    # Strip YAML frontmatter (---\n...\n---\n), 不吞正文里的 "---" 分隔线
+    # 跟 rewrite_prompt.py round-3 fix 同步 — 旧版 split("---") 太广吞 prompt 主体
+    _frontmatter_pat = re.compile(r"\A---\s*\n.*?\n---\s*\n", re.DOTALL)
+    s = _frontmatter_pat.sub("", prompt, count=1).strip()
 
     s = _negate_to_positive(s)
     s = _strip_batch_words(s)
 
-    size, source, target = _extract_and_normalize_size(prompt)
+    size, source, target, upscaled = _extract_and_normalize_size(prompt)
     info["size"] = size
     info["size_source"] = source
     info["target_size"] = target
+    info["upscaled"] = upscaled
 
     return s, info
 
