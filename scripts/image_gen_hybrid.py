@@ -37,6 +37,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 from prompt_sanitize import (  # noqa: E402
     SENTINEL, validate_rewritten,
     sanitize_post_rewrite, sanitize_raw_user_prompt,
+    _round_to_multiple_of_16,  # 给 --size 显式传时也走 ÷16 round
 )
 from _credentials import load_credentials as _load_credentials, CredentialsError  # noqa: E402
 
@@ -187,16 +188,34 @@ def main():
     DEFAULT_SIZE = "2048x1152"
     size_override_note = None  # 写进 meta 给 audit trail (round-5 blind #8)
     if args.size:  # 显式传 (batch 配)
-        effective_size = args.size
-        if extracted and extracted != args.size:
+        # 显式 --size 也走 ÷16 round (R7-13 fix: 之前 --size 直接给 ephone, 但 ephone 严
+        # 要求 ÷16, "1920x1080" 直传被 400 reject. batch_runner 永远传 --size, 所有
+        # anchor batch 全 fail). 跟 sanitize 提取的显式 WxH 用同样的 round 逻辑.
+        try:
+            w_raw, h_raw = (int(x) for x in args.size.split("x"))
+            w_rounded = _round_to_multiple_of_16(w_raw)
+            h_rounded = _round_to_multiple_of_16(h_raw)
+            rounded = f"{w_rounded}x{h_rounded}"
+        except (ValueError, AttributeError):
+            # --size 格式不对 (e.g. "auto" / "1024" / 空), 不做 round 直接透传让 ephone 报错
+            rounded = args.size
+            w_raw = h_raw = None
+        effective_size = rounded
+        if w_raw is not None and rounded != args.size:
+            # round 改了 size → 让 post-resize crop 回 user 显式要求的 args.size
+            sanitize_info["target_size"] = args.size
+            sanitize_info["upscaled"] = False
+            print(f"  ↻ explicit --size {args.size} → ephone 用 ÷16 合规 {rounded} → PIL crop 回 {args.size}", flush=True)
+        if extracted and extracted != rounded:
             size_override_note = (
-                f"explicit --size {args.size} 优先, prompt 内 size {extracted} 被忽略 "
+                f"explicit --size {args.size} (round → {rounded}) 优先, prompt 内 size {extracted} 被忽略 "
                 f"(原因: {sanitize_info.get('size_source')})"
             )
             print(f"  ⚠ {size_override_note}", flush=True)
-            # 既然忽略 sanitize 的 size, target_size 也清掉防止 post-resize 跑错
-            sanitize_info["target_size"] = None
-            sanitize_info["upscaled"] = False
+            # 既然忽略 sanitize 的 size, target_size 也清掉除非上面 round 已设
+            if rounded == args.size:
+                sanitize_info["target_size"] = None
+                sanitize_info["upscaled"] = False
     elif extracted:
         effective_size = extracted
         print(f"  ↪ size from prompt: {extracted} ({sanitize_info.get('size_source')})", flush=True)
