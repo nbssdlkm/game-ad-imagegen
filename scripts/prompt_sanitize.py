@@ -39,11 +39,10 @@ def _strip_batch_words(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-# === 否定 → 正向 (兜底) ===
+# === 否定 → 正向 (兜底, 题材无关) ===
 NEGATIVE_REWRITES = [
-    (re.compile(r"UI\s*文本\s*(全)?\s*(去掉|去除|删除|不要)"), "画面所有 UI 文字位完全留白,不渲染任何中英文字符"),
-    (re.compile(r"(去掉|去除|删除|不要)\s*UI\s*(文本|文字)?"), "画面所有 UI 文字位完全留白,不渲染任何中英文字符"),
-    (re.compile(r"文字\s*全\s*(去掉|去除|删除|不要)"), "画面所有文字位完全留白,不渲染任何中英文字符"),
+    (re.compile(r"(UI\s*)?文(本|字)\s*(全)?\s*(去掉|去除|删除|不要)"), "画面不渲染任何中英文字符"),
+    (re.compile(r"(去掉|去除|删除|不要)\s*(UI\s*)?文(本|字)"), "画面不渲染任何中英文字符"),
     (re.compile(r"不要\s*大模型颗粒感|不要\s*AI\s*颗粒感|不要.*?颗粒感"), "渲染高清平滑无 AI 噪点伪影"),
 ]
 
@@ -58,10 +57,10 @@ def _negate_to_positive(text: str) -> str:
 SIZE_PATTERNS = [
     # "WxH" (1920x1080, 2048x1152, 650x250)
     (re.compile(r"\b(\d{3,4})\s*[xX×\*]\s*(\d{3,4})\b"), "explicit_wxh"),
-    # "宽高比 X:Y" / "X:Y" (9:16, 16:9)
+    # "宽高比 X:Y" / "X:Y" (9:16, 16:9) — 必须有 anchor word (避免误匹配 "技能 3:7 概率" / "标:文" 等)
     (re.compile(r"宽高比\s*(\d{1,2})\s*[:：]\s*(\d{1,2})"), "ratio"),
-    (re.compile(r"(?:比例|宽高比)\s*[:：]?\s*(\d{1,2})\s*[:：]\s*(\d{1,2})"), "ratio"),
-    (re.compile(r"\b(\d{1,2})\s*[:：]\s*(\d{1,2})\b(?!\d)"), "ratio_loose"),  # bare X:Y, weak
+    (re.compile(r"(?:比例|宽高比|画幅|尺寸比|横纵比|aspect)\s*[:：]?\s*(\d{1,2})\s*[:：]\s*(\d{1,2})"), "ratio"),
+    (re.compile(r"(\d{1,2})\s*[:：]\s*(\d{1,2})\s*(?:版|横|竖|portrait|landscape)"), "ratio_with_anchor"),
 ]
 
 # 关键字 → 比例 hint
@@ -110,10 +109,7 @@ def _aspect_to_size(w: int, h: int, target_short: int = 1152) -> str:
         return f"{short}x{long_edge}"
 
 
-def _gcd(a: int, b: int) -> int:
-    while b:
-        a, b = b, a % b
-    return a
+from math import gcd as _gcd  # stdlib since 3.5; 删除自实现
 
 
 def _extract_and_normalize_size(text: str) -> tuple[str | None, str, str | None]:
@@ -200,9 +196,9 @@ def sanitize_post_rewrite(prompt: str) -> tuple[str, dict]:
     else:
         info["sentinel_ok"] = True
 
-    # 兜底清洗
-    cleaned = _negate_to_positive(prompt)
-    cleaned = _strip_batch_words(cleaned)
+    # SENTINEL 通过 → 信任 rewriter 输出, 不再跑 _negate_to_positive (避免双重 regex sub
+    # 把 rewriter 写的正向指令再 substitute 一遍). 只 strip 显式批量数字词 (rewriter 偶发漏).
+    cleaned = _strip_batch_words(prompt)
 
     # Size 提取 (从原 prompt 而非 cleaned, 避免清洗破坏数字)
     size, source, target = _extract_and_normalize_size(prompt)
@@ -252,8 +248,8 @@ if __name__ == "__main__":
         ("size 650x250", "通用素材封面图,650*250", None),
         ("size 5000x3000", "超大图 5000x3000", None),
         ("size 竖屏", "做一张竖屏头像", None),
-        ("rewritten check OK", f"{SENTINEL}\n用途: game-ad\n主要请求: 关羽广告图\n构图: 1920x1080 横版", None),
-        ("rewritten check FAIL", "用途: game-ad (没有 sentinel)\n做关羽广告图,2048x1152", None),
+        ("rewritten check OK", f"{SENTINEL}\n用途: ad\n主要请求: 主角立绘\n构图: 1920x1080 横版", None),
+        ("rewritten check FAIL", "用途: ad (没有 sentinel)\n做主角立绘,2048x1152", None),
     ]
     for name, prompt, _ in tests:
         if SENTINEL in prompt:
