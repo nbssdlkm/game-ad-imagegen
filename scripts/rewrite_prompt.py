@@ -67,6 +67,14 @@ REWRITE_SYSTEM = f"""你是 `game-ad-imagegen` skill 内部的 prompt 重写 age
 - 实用 layout 提示 (e.g. "give negative space for headline if needed")
 - 支持已述请求的合理场景具体化
 
+**不算 augmentation (是 normalization / structural enforcement, 即使 user prompt 已 detail 也必须注入)**:
+- Rule 10 默认约束 (`no logos, no trademarks, no watermark` / use-case-specific defaults)
+- anchor phase3 LOCK 句 ("严格匹配 Image N 的渲染风格...")
+- 反 hallucination 黑名单 ([Vision Notes] 块 / 不复制 ref verbatim 文字)
+- edit invariants (`change only X; keep Y unchanged`)
+- Rule 11 letter-by-letter 拆字注释 (image model spelling hint)
+这些是 codex 上游已 codify 的 baseline 跟 structural 防护层, 跟"加 user 没要求的细节" (augmentation) 性质不同, 不受 Specificity policy "detail prompt 不 augment" 约束。
+
 ==== 输入 ====
 - 一组参考图 (按顺序编号 Image 1, Image 2, ...)
 - 一段用户的中文需求
@@ -85,11 +93,13 @@ REWRITE_SYSTEM = f"""你是 `game-ad-imagegen` skill 内部的 prompt 重写 age
 
 ```
 [Vision Notes]
-- Image 1: <plain 描述 — 性别/年龄/发色/发型/服装颜色与款式/武器具体形状/可见装饰/可见文字 verbatim>
+- Image 1: <plain 描述 — 性别/年龄/发色/发型/服装颜色与款式/武器具体形状/可见装饰/可见文字 verbatim/装饰元素细颗粒, 全部塞进**一个** bullet 内, 不要拆多 bullet>
 - Image 2: <同上, 不基于训练先验, 看到啥写啥>
 - ...
 [/Vision Notes]
 ```
+
+**严格 enforce — 每张 ref 必须 = 1 个 `- Image N:` bullet** (round-7 case_22 实测抓的: 之前装饰元素细颗粒规则被 LLM 误解为"另起一行" → 同一张图被拆 2 个 bullet, 下游 parse 会以为是 2 张图)。一个 bullet 内可以用 ` ; ` / `,` 分句, 或换行 + 2 空格缩进延续, 但**不能起新 bullet**。
 
 **反 hallucination 规则 (强 enforce, 题材无关)**:
 1. 看到角色辨不出具体身份 → 写 "<体型/性别>, <实际服装颜色与造型>" — **绝不可凭训练先验猜任何具体历史人物/franchise/动漫/游戏角色名**, 除非:
@@ -156,9 +166,12 @@ REWRITE_SYSTEM = f"""你是 `game-ad-imagegen` skill 内部的 prompt 重写 age
 
 ==== 关键规则 (严格 enforce) ====
 1. **构图复刻 ref 实际形态**: 主体数量 + 版式按 ref vision 看到的实际形态 — ref 是单主体就单主体, 群像就群像, 分镜/拼图/split-screen 就照 ref 实际形态。**不预设任何主体数量上限**, 也不预设单 panel/多 panel 偏好。
-2. **文字位数量 = 模仿 ref 字位密度**: image model 在 ≥6 文字位时文字渲染塌, 所以**上限 5 个文字位**。下限 = ref 实际字位数 (ref 几位就几位, 0 位也允许, 意思整图不渲染任何文字)。两条规则:
+2. **文字位数量 = 模仿 ref 字位密度**: image model 在 ≥6 文字位时文字渲染塌, **默认上限 5 个文字位**。下限 = ref 实际字位数 (ref 几位就几位, 0 位也允许, 意思整图不渲染任何文字)。两条规则:
    - **不要无中生有加字位**: ref 是无文字 splash / concept art / 纯视觉 KV → 输出也不加文字, 哪怕 user prompt 提到 quoted 字面, 也只放到 user 显式指定的一个字位 (没就空)
    - **字位密度高的 ref 也别超 5**: ref 上有 8-10 字位密集 → 输出截到 ≤5 个最关键字位 (优先 user 显式指定的 > ref 上最显著的字位 > ref 上较次的字位, 其他略)
+
+  **edit use case 豁免 (跟 Rule 10 同步)**: 若 user 任务是**保留 ref 全部字位只改其中一两个**的 edit (text-localization / identity-preserve / precise-object-edit / lighting-weather / background-extraction / style-transfer / compositing / sketch-to-render 等所有 "改 X 不动其余字位" 场景), **本默认 5 上限失效, 改用 "字位数 = ref 实际字位数 (无上限)"**。配合 Rule 10 的 "no extra text outside [文字] section" 同步豁免, 防互锁让 model 删 ref 既有字位。判断 trigger: user 说"其他不变" / "保留原 UI" / "只改 X" / "把 X 改成 Y" 都属此类。
+
   每个保留字位填什么:
    - (a) user 显式指定的 quoted 字面 → verbatim
    - (b) ref 上有字位但 user 没指定内容 → 按 ref 字位的**语义功能**填对应内容 (ref 上原是 X 类信息 → 当前主体对应 X 类信息). 具体语义类型由 vision 实际识别决定, 不预设
@@ -171,17 +184,19 @@ REWRITE_SYSTEM = f"""你是 `game-ad-imagegen` skill 内部的 prompt 重写 age
 9. **复刻 ref 视觉特征 + 不复制 ref 文字 verbatim**: image model 看 ref 时会把 ref 上的文字直接 copy 进新图。约束必须含 "do NOT copy any **text content** from reference images; only use text from the [文字 verbatim] section below"。**关键**: "避免"段**只禁文字 verbatim 内容**, **绝不能扩成"不要复制 ref 上的任何视觉特征"** — 过广避免会让 model 同时 strip ref 的视觉元素, 导致出图比 ref 简陋。正确写法: "不要复制 ref 上的 verbatim 文字内容; 复刻 ref 的视觉特征 (按 [Vision Notes] 里列出的视觉元素清单)"。
 10. **默认约束** (跟 codex 上游 sample-prompts 13 个 recipe 默认带的一致): 除非 user 显式说"要 logo / 要 watermark", 每段 prompt 的 [约束] 段必须含:
    - `no logos, no trademarks, no watermark` (所有 use case 通用)
-   - `no extra text outside [文字] section` — **但 text-localization / identity-preserve / precise-object-edit 等 edit use case 要保留 ref 全部既有字位时本项失效** (改 X 不动其他, 其余字位都要 verbatim 保留, 否则跟 Rule 9 "复刻 ref 视觉特征" + Rule 2 "字位上限 5 截到关键" 在 ref 字位 >5 时互锁让 model 删 ref 既有字位); logo-brand / wordmark 等文字本身就是主体的 use case 同样豁免
+   - `no extra text outside [文字] section` — **行为定义豁免** (替代之前的 slug 白名单, 防漏 slug): 若 user 任务是 **"改 X 不动其余字位" 的 edit 场景** (任何 edit slug 都可能命中: text-localization / identity-preserve / precise-object-edit / lighting-weather / background-extraction / style-transfer / compositing / sketch-to-render 等, 判断信号 = user 说"其他不变" / "保留原 UI" / "只改 X"), 本项失效, 改用 `change only <X>; keep all other text verbatim`。logo-brand (含 wordmark / 字体设计 / 字体本身为主体的 use case) 同样豁免。**跟 Rule 2 字位上限豁免同步**, 防互锁让 model 删 ref 既有字位
    - 若 use case 是 photorealistic-natural → 加 `no studio polish, no staged look` 让 model 走自然摄影质感
    - 若 use case 是 ui-mockup / infographic-diagram → 加 `clear hierarchy, readable typography`
-   - **anchor_phase=phase3 时本 Rule 全部 use-case-specific 默认约束失效, 以 picked anchor 实际渲染风格为准** (e.g. anchor 本就 studio polish 时 phase3 不再加 "no studio polish" 反约束)。`no logos/trademarks/watermark` 通用项仍生效, edit use case 的 "no extra text 豁免" 也仍生效。
-   这些默认约束**不算 augmentation 而算 normalization** — 是 codex 上游已 codify 的 baseline, 不算"凭空加细节"。
-11. **长数字 / 中英混排 / 生僻字 / diacritic letter-by-letter 处理**: image model 看 verbatim 字符串容易吞字 / 漏字 / 错字。文字位含以下任一情况时 (按命中频率排序), 在该字位的 verbatim 内容后加拆分注释:
-   - 长数字串 ≥5 位 (高频 — 战力数值/抽奖码/账号): "99999 >> 188888" (数字: 9-9-9-9-9 ›› 1-8-8-8-8-8); "85618" (数字: 8-5-6-1-8)
-   - 中英混排短词 (中频 — UI 标签/版本号): "VIP特权" (拼字: V-I-P-特-权); "iOS版" (拼字: i-O-S-版)
-   - 生僻汉字 (低频): "燚阳殿" (拆字: 燚-阳-殿)
-   - 英文人名带 diacritic (极低频, game-ad 几乎不命中, 仅做完备性列出): "Müller" (拼字: M-ü-l-l-e-r)
+   - **anchor_phase=phase3 时本 Rule 全部 use-case-specific 默认约束失效, 以 picked anchor 实际渲染风格为准** (e.g. anchor 本就 studio polish 时 phase3 不再加 "no studio polish" 反约束)。`no logos/trademarks/watermark` 通用项仍生效, edit "改 X 不动其余" 的"no extra text 豁免"也仍生效。
+   这些默认约束**不算 augmentation 而算 normalization** — 是 codex 上游已 codify 的 baseline, 不算"凭空加细节" (跟 Specificity policy 的 "禁加 augmentation" 区分: 见 Specificity policy 段末尾 "不算 augmentation 的项")。
+11. **长数字 / 中英混排 / 生僻字 / diacritic letter-by-letter 处理**: image model 看 verbatim 字符串容易吞字 / 漏字 / 错字。文字位含以下任一情况时 (按命中频率排序), 在该字位的 verbatim 内容后加**括号拆分注释**:
+   - 长数字串 ≥5 位 (高频 — 战力数值/抽奖码/账号): `"99999"` 加 `(数字: 9-9-9-9-9)`; ref 上若有方向符 (`›`/`→`/`>>`/`›››` 等), 用 ref 实际看到的符号 verbatim, 不要 system prompt 强制改某种
+   - 中英混排短词 (中频 — UI 标签/版本号): `"VIP特权"` 加 `(拼字: V-I-P-特-权)`; `"iOS版"` 加 `(拼字: i-O-S-版)`
+   - 生僻汉字 (低频): `"燚阳殿"` 加 `(拆字: 燚-阳-殿)`
+   - 英文人名带 diacritic (极低频, game-ad 几乎不命中, 仅做完备性列出): `"Müller"` 加 `(拼字: M-ü-l-l-e-r)`
    常见汉字 (e.g. "登录"/"领取"/"挑战") **不需要**拆分, 拆所有字会反向稀释 prompt budget。
+
+   **跟 Rule 4 verbatim 的边界**: 括号注释 `(数字: ...)` / `(拼字: ...)` 是给 image model 的 **spelling hint, 不会被渲染成字位本体**。image model 已训练成识别 `"<verbatim>" (拼字/数字/拆字: ...)` 这种括号注释为 hint 不为内容。下游 image_gen tool 接收 prompt 后, 实际画进图里的只有引号内的 verbatim 字面。
 
 ==== Anchor 模式特殊处理 ====
 - anchor_phase="phase1" (出 M 候选给 user 挑):
@@ -279,12 +294,24 @@ def rewrite(user_prompt: str, reference_images, n: int = 1,
 
     user_text = user_prompt
     if n > 1:
-        user_text += (
-            f"\n\n[runner 指令] 产出 {n} 段独立的中文 structured prompt (每段对应 1 张输出图),"
-            f"用单独一行 `{PROMPT_SEP}` 分隔。每段要 feature 不同的 primary character "
-            f"(从 CandidatePool 选),非 anchor phase3 模式下要给 series 视觉 variety。"
-            f"从 user 输入中删除批量控制词 ('分别' / '{n} 张' 等)。"
-        )
+        if anchor_phase == "phase1":
+            # phase1 是"同段 prompt × M sampling 产候选", N 段必须**完全相同 prompt**
+            # 让 sampling 产生 variety 而不是 prompt 不同导致主体漂. 这里实际 caller 不该传 n>1
+            # 给 phase1 (batch_runner 调时永远 n=1 给 phase1), 但加 defense 防未来误用
+            user_text += (
+                f"\n\n[runner 指令 — ANCHOR PHASE 1] 产出 {n} 段**完全相同**的中文 structured prompt "
+                f"(每段对应 1 张候选, 让 image_gen sampling 产生 pose/细节 variety, **不是 prompt variety**), "
+                f"用单独一行 `{PROMPT_SEP}` 分隔。Rule 5 (series variety) 在 phase1 下**失效** — "
+                f"phase1 候选必须同主体同角色让 user 后续从中挑 1 张作 anchor。"
+                f"从 user 输入中删除批量控制词 ('分别' / '{n} 张' 等)。"
+            )
+        else:
+            user_text += (
+                f"\n\n[runner 指令] 产出 {n} 段独立的中文 structured prompt (每段对应 1 张输出图),"
+                f"用单独一行 `{PROMPT_SEP}` 分隔。每段要 feature 不同的 primary character "
+                f"(从 CandidatePool 选),非 anchor phase3 模式下要给 series 视觉 variety。"
+                f"从 user 输入中删除批量控制词 ('分别' / '{n} 张' 等)。"
+            )
     else:
         user_text += "\n\n[runner 指令] 产出 1 段中文 structured prompt (单张输出)。"
 
@@ -295,6 +322,9 @@ def rewrite(user_prompt: str, reference_images, n: int = 1,
             "写 1 段精心打磨的中文 prompt,明确角色选定 (不要故意模糊 — sampling 会自然提供 pose/细节 variety)。"
         )
     elif anchor_phase == "phase3":
+        # Phase 3 不支持 0 ref (anchor 本身是 ref), 早 raise 避免 anchor_idx 校验跑出 "1..0" confusing 错误
+        if len(ref_paths) == 0:
+            raise ValueError("anchor_phase=phase3 requires ≥1 ref image (picked anchor 作为 ref 必须存在)")
         if anchor_idx is None:
             anchor_idx = len(ref_paths)
         if anchor_idx < 1 or anchor_idx > len(ref_paths):
@@ -362,12 +392,18 @@ def rewrite(user_prompt: str, reference_images, n: int = 1,
                 if "reasoning" in emsg and any(s in emsg for s in ("unknown", "unsupported", "invalid", "400")):
                     is_reasoning_unsupported = True
             if is_reasoning_unsupported and use_reasoning and not reasoning_fallback_done:
-                # Fallback to no-reasoning. 不消耗 retry slot — append 一个 0-sleep attempt 到末尾抵消本次消耗
-                # (R6-3 fix: 之前是 `continue` 让 attempt_idx 自然 +1, 等于 reasoning fallback 烧 1 个 transient retry 预算)
-                print(f"  [rewrite-cn] WARN: model={model} 不支持 reasoning_effort, fallback to no-reasoning (立即重试, 不消耗 retry slot)", file=sys.stderr, flush=True)
+                # Fallback to no-reasoning. 不消耗 transient retry 预算 也不悄悄 +1 总 budget
+                # (R7-2 fix: R6-3 原版 `attempts.append(0)` 让总 budget 静默从 3 升到 4 跟注释"补回 slot"
+                # 不符. 现在改 insert 1 个 0-sleep slot 到当前位置 + pop 尾部 1 个 sleep slot, 保总长仍是 3)
+                print(f"  [rewrite-cn] WARN: model={model} 不支持 reasoning_effort, fallback to no-reasoning (立即重试, 不消耗 transient retry 预算)", file=sys.stderr, flush=True)
                 use_reasoning = False
                 reasoning_fallback_done = True
-                attempts.append(0)  # 补一个 0-sleep slot, 保 transient retry 预算不缩水
+                # 当前 attempt 让出来给立即重试 + 从尾部砍 1 个 sleep slot 平衡 (净 budget 不变)
+                # 边缘 case: 如果尾部只剩当前 attempt 自己 (其他 sleep slot 都用过了), pop 会让总长缩水,
+                # 加 guard 防 pop 自己
+                if len(attempts) - 1 > attempt_idx + 1:
+                    attempts.pop()  # 删尾部一个 sleep slot
+                attempts.insert(attempt_idx + 1, 0)  # 当前 attempt 后面插一个 0-sleep
                 attempt_idx += 1
                 continue
             # 判断是否是 transient: HTTP status code in _TRANSIENT_STATUSES
@@ -389,7 +425,11 @@ def rewrite(user_prompt: str, reference_images, n: int = 1,
             raise RuntimeError("rewrite-cn LLM 返回空")
         return [_wrap_with_sentinel(text)]
 
-    raw_parts = [p.strip() for p in text.split(PROMPT_SEP)]
+    # 用 line-anchored multiline regex 分割, 防 LLM 在 [文字] verbatim 段或 [Vision Notes] 里嵌入
+    # `---PROMPT-SEP---` 字面 (e.g. user prompt 含 "做几张图分别...---PROMPT-SEP---")
+    # 触发误分段 (R7-8). 只 split 在**整行 = 分隔符**的位置, 行内出现的 verbatim PROMPT-SEP 不算
+    _sep_pat = re.compile(rf"^\s*{re.escape(PROMPT_SEP)}\s*$", re.MULTILINE)
+    raw_parts = [p.strip() for p in _sep_pat.split(text)]
     parts = [_strip_fence(p) for p in raw_parts if p.strip()]
 
     if len(parts) == 0:
