@@ -2,7 +2,7 @@
 name: game-ad-imagegen
 description: |
   生成**游戏买量广告图 / 海报 / 买量素材**(特化场景)。当用户提供「爆款参考图 + 实机图 + 中文 prompt」请你做 N 张游戏广告系列图时使用。
-  Hybrid path (2026-05-16): 调用 `/v1/responses` + `image_generation` tool (跟 ChatGPT 网页版同源, 一体化 vision + 生图), model `gpt-5.4 + reasoning_effort=medium`, 默认 size `2048x1152` (16:9, ÷16 合规). 由 `rewrite_prompt.py` 输出**中文 structured prompt** (codex labeled-lines 模板 + 强制 `[Vision Notes]` 块反 hallucination), 经 `prompt_sanitize.py` 兜底层 (SENTINEL 验 / size auto-fit / 否定→正向) 送 `image_gen_hybrid.py`. 任意 user 期望 size 都能 honor (1920x1080 → ephone ÷16 round 1920x1088 → PIL center crop 回 1080 / 650x250 banner < 655K 像素 → ephone upscale 到 2624x1024 → LANCZOS resize 回 user 期望). 题材无关 / 角色无关。非游戏广告题材请走 codex-imagegen-fork。
+  Pipeline: rewrite_prompt.py (中文 structured prompt + [Vision Notes] 反 hallucination) → prompt_sanitize.py (SENTINEL 验 + size auto-fit) → image_gen_hybrid.py (/v1/responses + image_generation tool, gpt-5.4 + medium reasoning, 跟 ChatGPT 网页版同源). 任意 user 期望 size 都自动 fit 回 (÷16 round 后 crop / sub-655K 像素 upscale 后 LANCZOS resize). 题材无关 / 角色无关。非游戏广告题材请走 codex-imagegen-fork。
   **跟 `codex-imagegen-fork` (B skill) 的差异化**:A 特化在**工作流**(爆款复刻 + 多张系列 + vision verify + anchor LOCK 主角身份不漂),**画面题材完全无关** — 输入是什么题材就出什么题材(三国/二次元/SLG/水墨/写实皆可);B 是通用图片任务(单图修改 / 0 图文生图 / 任意题材, 无 anchor workflow)。设计师"复刻爆款 + 出 N 张系列"走 A;"通用修图 / PS 一下 / 纯文字生一张"走 B。
   触发词:复刻这张爆款图给我们游戏 / 做几张游戏广告图 / 学这张图做几张类似的 / 游戏海报生成 / 买量素材 / 任意题材的游戏广告图复刻 / 出 N 张系列广告图。
 ---
@@ -11,10 +11,11 @@ description: |
 
 ## 🚨 Hard Invariant — 必读
 
-**进入 image API 的每一个 prompt 必须由 `scripts/rewrite_prompt.py` 产出，无任何 bypass**。没有这条，agent 自己手写 prompt 会幻觉一个跟参考图毫无关系的内容 (历史失败模式), skill 失去意义。
+**强烈建议: 进入 image API 的每一个 prompt 都由 `scripts/rewrite_prompt.py` 产出**。没有这条 + agent 自己手写 prompt 容易幻觉一个跟参考图毫无关系的内容 (历史失败模式)。
 
 `scripts/image_gen_hybrid.py` 入口校验:
-- **SENTINEL marker 校验** — prompt 第一行必须是 `# REWRITTEN-CN-V2`（由 `rewrite_prompt.py` 自动加在每段产出的开头）。缺标记 → 走 `sanitize_raw_user_prompt` 兜底入口 + warning. (hybrid 路径**没有** CJK 字符占比闸 — rewriter 输出本身就是中文, 不能用 CJK 占比拒)
+- **SENTINEL marker 校验** — prompt 第一行是 `# REWRITTEN-CN-V2` (rewrite_prompt 自动加在每段开头) → 走 `sanitize_post_rewrite` 主路径
+- **未通过 SENTINEL** → 走 `sanitize_raw_user_prompt` 兜底入口 + meta warning. **不 hard fail** — 让 raw user prompt 也能跑 (e.g. 开发者直接传英文 prompt 调试) 但 user 可看 meta warning 决定要不要重跑 rewriter
 
 **已删的全部 bypass 路径**：
 - `--no-rewrite` CLI flag
@@ -45,9 +46,14 @@ LLM agent 检测到下列条件命中时启动 skill：
 2. 用户 prompt 中含"广告图 / 海报 / 买量素材 / 复刻 / 学这张图 / 做 N 张类似的 / 改文案 / 把图1改成 X" 或同义 / 类似词
 3. 输出张数 N ≥ 1（"做 1 张" / "做 5 张" 都支持）
 
-**支持的形态**：1 张图改文案 / 2 张爆款风格融合 / 3 张含 UI+文字+角色头像迁移 / 5+ 张实机图自由组合 — 都走 A skill；图的角色（参考 / 素材 / 叠加目标）由用户 prompt 描述 + vision 实际识别决定。
+**支持的形态** (形态 = ref 数量 + 用途分工, 不预设题材, 任何题材的 ref 都按此分类处理):
+- 1 张图: 单图编辑 / 改文字 / 改局部
+- 2 张图: 两张 ref 融合 (一张取构图, 另一张取主体, 或两张都做素材)
+- 3 张图: 含多重 role 分工 (如"图1 UI/图2 主体/图3 头像")
+- 5+ 张图: 多素材自由组合 (vision 自己识别每张的用途)
+图的 role (参考 / 素材 / 叠加目标 / style anchor / edit target 等) 由用户 prompt 描述 + vision 实际识别决定。
 
-**0 图模式**：用户给 0 张参考图 + 纯文字描述游戏买量素材（如"做一张三国主题游戏 banner，主标题立即下载"），hybrid 不切端点 — `/v1/responses` + `image_generation` tool 同样接受 0 图 (refs 为空数组), text2im 模式仍走 rewrite_prompt + SENTINEL 单闸。Anchor mode 不支持 0 图（vision verify 需要图）。**非游戏广告题材**（产品照 / 企业 logo / 真实摄影 / infographic 等通用任意题材）→ B skill `codex-imagegen-fork`，那边的 system prompt 是 generic taxonomy 不会强加买量风格。
+**0 图模式**：用户给 0 张参考图 + 纯文字描述（如"做一张 banner，主标题立即下载"），hybrid 不切端点 — `/v1/responses` + `image_generation` tool 同样接受 0 图 (refs 为空数组), text2im 模式仍走 rewrite_prompt + SENTINEL 单闸。Anchor mode 不支持 0 图（vision verify 需要图）。**非游戏广告题材**（产品照 / 企业 logo / 真实摄影 / infographic 等通用任意题材）→ B skill `codex-imagegen-fork`，那边的 system prompt 是 generic taxonomy 不会强加买量风格。
 
 ## 必读约束（QUALITY INVARIANTS）
 
@@ -56,7 +62,7 @@ agent 在 Step 4 装配 prompt 时遵守以下 quality 约束 (hybrid path 由 r
 | 约束 | 含义 | 失败案例 |
 |---|---|---|
 | ✅ 每张参考图的角色由 vision 实际看到的内容判断 | 不预设"图1=风格 / 图2+=角色源"二分。每张图当什么用(style 锚 / 角色源 / UI 模板 / 文案模板 / 改文案目标)由 vision 实际看到的内容 + 用户 prompt 上下文决定 | 凭文件路径名 / 序号 / 训练先验假设图用途 → hallucinated prompt(已知失败模式) |
-| ✅ image_gen 一次性画 readable Chinese text | 标题/CTA/气泡/副文案全在 image_gen 里完成 | 留白后期 Pillow 叠字 → 字体单薄、不融合 |
+| ✅ image_gen 一次性画 ref 上 vision 看到的所有字位 | ref 上所有文字位都让 image_gen 直接画在图里 | 留白后期 Pillow 叠字 → 字体单薄、不融合 |
 | ❌ 不允许 Pillow 后期叠字 | 不要写 `Text (verbatim): none. Leave blank.` 这种留白指令 | 留白叠字反模式 |
 | ✅ ~70% 锚定参考图实际看到的内容，~30% 创作变化 | 风格 / 构图 / 角色形象基于 vision 实际看到的参考图内容 | 100% 复制参考图 = 失败；过度发挥脱离参考图 = 失败 |
 | ✅ 角色/资产从用户实际提供的图里选 | 不能凭空发明用户没给的角色 | 凭训练先验幻觉一个用户没给的角色 = 失败 |
@@ -169,18 +175,23 @@ python scripts/rewrite_prompt.py \
 
 **为什么 prompt 字面精度直接决定结果**：`image_gen_hybrid.py` 用 `/v1/responses` + `image_generation` tool 端点 — **prompt 字面 + refs 一起送给 image model, model 内部 vision + 生图一体化处理**。verbatim 中文准确度靠 rewrite 字面精度，scene complexity 直接决定 image model text 渲染 budget。
 
-#### rewriter 内部规则 (供 agent 排错时理解 rewrite 行为)
+#### rewriter 内部规则 (跟 `rewrite_prompt.py REWRITE_SYSTEM` 1:1)
 
-下方是 `rewrite_prompt.py` 的 `REWRITE_SYSTEM` 内部规则摘要。**agent 不需要自己手抄这些规则手写 prompt** — rewriter LLM 已经按这些规则跑。贴在这里供 agent 排错 / 解释 rewriter 输出给用户:
+下方 9 条规则跟 rewriter system prompt `==== 关键规则 ====` 段 1:1 对齐 (顺序 + 编号同步)。**agent 不需要自己手抄这些规则手写 prompt** — rewriter LLM 已经按这些规则跑。贴在这里供 agent 排错 / 解释 rewriter 输出。完整规则见 `rewrite_prompt.py:REWRITE_SYSTEM`。
 
-1. **[Vision Notes] 强制开头**: rewriter 输出每段必须以 `[Vision Notes]` 块开头, plain 描述每张 ref 实际看到的内容 (反 hallucination). 看不出角色身份就写视觉特征 placeholder, 绝不凭训练先验猜具体历史人物 / franchise 角色名。
-2. **字位数量模仿 ref 字位密度**: 上限 5, 下限 = ref 实际字位数 (ref 0 字位则不渲染任何文字; ref 字位密集则截到 ≤5 个最关键). 字位语义功能跟 ref 一致 (ref 上原是 X 类信息 → 当前主角 X 类信息) — 不预设具体字位类型。
-3. **每字位 verbatim quoted**: 在 [文字 verbatim] 段每个字位写 `<位置>: "<exact 字面>"`. 不要含糊地说"主题文字"否则被 image model hallucinate。
-4. **每张 ref 独立 labeling**: 每张 ref 在 [参考图角色] 段独立 line + role (composition reference / character source / style reference / edit target 等, 自由文本), 不 collapse 成"主图 / 副图"二分。Ref 顺序按 user "图1/图2/..."语义, 不靠文件名字母序。
-5. **70/30 faithful/creative**: rewriter system prompt 显式写 "保留约 70% ref 视觉, 30% 创作自由发挥"。
-6. **风格词从 vision 抽**: rewriter 描述风格用 vision 看到的笔触/材质/光影/线条, **不写任何 franchise/IP/题材名先验**。
-7. **装饰图形语言保留 + 文字 verbatim 不复制**: 避免段只禁 ref 文字 verbatim 内容, 装饰图形 (按 [Vision Notes] 列出的装饰元素) 必须复刻形态. 不能写"不要复制 ref 上的所有视觉元素"这种过广避免 — 会让 image model strip 装饰导致出图比 ref 简陋。
-8. **题材完全无关**: rewriter 对任何题材 (三国/二次元/SLG/魔幻/科幻/水墨/写实/概念原画/赛博朋克/抽象艺术等) 都按 ref 实际 vision 输出, 不预设任何题材偏好。
+1. **构图复刻 ref 实际形态**: 主体数量 + 版式按 ref vision 看到 — 单主体就单主体, 群像就群像, 分镜/拼图就照 ref. **不预设主体数量上限**, 也不预设 single/multi panel 偏好。
+2. **字位数量模仿 ref 字位密度**: 上限 5, 下限 = ref 实际字位数 (ref 0 字位则不渲染任何文字; ref 字位密集则截到 ≤5 个最关键). 字位语义功能跟 ref 一致 (ref 上原是 X 类信息 → 当前主体 X 类信息), 不预设具体字位类型。
+3. **删 user prompt 的批量控制语言**: "分别 / N 张 / 分两排" 这些是告诉 rewriter 产几段, 不是视觉指令, 不 echo 进任何 prompt。
+4. **Verbatim**: 每字位写 `<位置>: "<exact 字面>"`. 永远不要含糊地说"主题文字"否则被 image model hallucinate。ref 上没字位则不写进 [文字] 段 (不写"留空")。
+5. **Series variety when N>1 (非 anchor phase3)**: 每段不同 primary subject (来自 CandidatePool), 不要 N 段全是同一主体的细微变体。
+6. **Style words from vision**: 用 vision 看到的实际笔触/材质/光影/线条/调色板/质感, **永远不写 franchise/IP/题材名先验** (任何具体作品名/题材名都不允许)。
+7. **Image role 显式 label**: 每张 ref 在 [参考图角色] 段显式 label 它的 role (composition reference / character source / style reference / edit target 等, 自由文本), 不 collapse 二分。Ref 顺序按 user "图1/图2/..."语义。
+8. **Edit mode 显式 invariants**: 若 user "改 X 其余不变", 约束必须含 "change only X; keep everything else (layout/typography/colors/composition/background) unchanged"。
+9. **复刻 ref 视觉特征 + 不复制 ref 文字 verbatim**: 避免段**只禁文字 verbatim**, 视觉特征 (按 [Vision Notes] 列出) 必须复刻形态。绝不能扩成"不要复制 ref 上的任何视觉元素"过广避免, 会让出图比 ref 简陋。
+
+补充 STEP A 强制规则 (不在 9 条 `==== 关键规则 ====` 里, 但 system prompt 同样硬约束):
+- **[Vision Notes] 强制开头**: 每段以 `[Vision Notes]` 块开头, plain 描述每张 ref 实际看到 (反 hallucination). 辨不出主体身份就写视觉特征 placeholder, 绝不凭训练先验猜具体历史人物/franchise 角色名。
+- **题材完全无关**: 对任何题材 (任何 IP/franchise/genre 不预设) 都按 ref vision 输出。
 
 #### Rewriter 输出格式 (中文 labeled lines, 单段示例)
 
