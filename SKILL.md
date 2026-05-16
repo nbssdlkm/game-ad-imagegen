@@ -175,9 +175,25 @@ python scripts/rewrite_prompt.py \
 
 **为什么 prompt 字面精度直接决定结果**：`image_gen_hybrid.py` 用 `/v1/responses` + `image_generation` tool 端点 — **prompt 字面 + refs 一起送给 image model, model 内部 vision + 生图一体化处理**。verbatim 中文准确度靠 rewrite 字面精度，scene complexity 直接决定 image model text 渲染 budget。
 
+#### Specificity policy (rewriter system prompt 顶部段, 跟 codex 上游 prompting.md 同源)
+
+rewriter 不是无脑展开 — **根据 user prompt 具体程度调整 augmentation 量**:
+
+- **user prompt 已经很具体** (有明确主体/场景/约束/字位/构图) → 只做 normalize / restructure 成 labeled lines, **不加创意需求**, 10 段模板里没信息的段**整段省略不凑数**
+- **user prompt 偏 generic** ("做张图" / "出个海报" / 只给图没给文字需求) → 可以 tasteful augment, 补 composition / lighting / scene 等帮 image model 落地的细节
+
+**禁加** (Disallowed, 强 enforce):
+- ref 没出现 + user 没提的额外 character / 物体 / 道具
+- 没 implied 的品牌名 / slogan / palette / 故事情节
+- 没排版依据的 side-specific placement (e.g. 凭空说"主角放左下角")
+
+**允许加** (Allowed): composition / framing 提示 / polish level / intended-use / 实用 layout / 支持已述请求的场景具体化。
+
+> agent 排错时如果发现 rewriter 输出"加了 user 没要求的细节"或"对 detail prompt 还在过度展开", 看这里是否违反, 用 user 原话 + Specificity 段反向 prompt 改 rewriter。
+
 #### rewriter 内部规则 (跟 `rewrite_prompt.py REWRITE_SYSTEM` 1:1)
 
-下方 9 条规则跟 rewriter system prompt `==== 关键规则 ====` 段 1:1 对齐 (顺序 + 编号同步)。**agent 不需要自己手抄这些规则手写 prompt** — rewriter LLM 已经按这些规则跑。贴在这里供 agent 排错 / 解释 rewriter 输出。完整规则见 `rewrite_prompt.py:REWRITE_SYSTEM`。
+下方 11 条规则跟 rewriter system prompt `==== 关键规则 ====` 段 1:1 对齐 (顺序 + 编号同步)。**agent 不需要自己手抄这些规则手写 prompt** — rewriter LLM 已经按这些规则跑。贴在这里供 agent 排错 / 解释 rewriter 输出。完整规则见 `rewrite_prompt.py:REWRITE_SYSTEM`。
 
 1. **构图复刻 ref 实际形态**: 主体数量 + 版式按 ref vision 看到 — 单主体就单主体, 群像就群像, 分镜/拼图就照 ref. **不预设主体数量上限**, 也不预设 single/multi panel 偏好。
 2. **字位数量模仿 ref 字位密度**: 上限 5, 下限 = ref 实际字位数 (ref 0 字位则不渲染任何文字; ref 字位密集则截到 ≤5 个最关键). 字位语义功能跟 ref 一致 (ref 上原是 X 类信息 → 当前主体 X 类信息), 不预设具体字位类型。
@@ -188,12 +204,20 @@ python scripts/rewrite_prompt.py \
 7. **Image role 显式 label**: 每张 ref 在 [参考图角色] 段显式 label 它的 role (composition reference / character source / style reference / edit target 等, 自由文本), 不 collapse 二分。Ref 顺序按 user "图1/图2/..."语义。
 8. **Edit mode 显式 invariants**: 若 user "改 X 其余不变", 约束必须含 "change only X; keep everything else (layout/typography/colors/composition/background) unchanged"。
 9. **复刻 ref 视觉特征 + 不复制 ref 文字 verbatim**: 避免段**只禁文字 verbatim**, 视觉特征 (按 [Vision Notes] 列出) 必须复刻形态。绝不能扩成"不要复制 ref 上的任何视觉元素"过广避免, 会让出图比 ref 简陋。
+10. **默认约束** (跟 codex 上游 sample-prompts 13 个 recipe 默认带的一致): 每段 [约束] 段必须含 `no logos, no trademarks, no watermark` (通用); `no extra text outside [文字] section` (**text-localization / identity-preserve / precise-object-edit 等保留 ref 全部既有字位的 edit use case 时本项失效**, logo-brand / wordmark 等文字本身就是主体的 use case 也豁免); photorealistic-natural 加 `no studio polish, no staged look`; ui-mockup / infographic-diagram 加 `clear hierarchy, readable typography`。**anchor_phase=phase3 时本 Rule 全部 use-case-specific 默认约束失效, 以 picked anchor 实际渲染风格为准** (`no logos/watermark` 通用项 + edit 豁免仍生效)。
+11. **生僻字 / 中英混排 / 长数字串 letter-by-letter 处理** (按 game-ad 命中频率排序): 长数字 ≥5 位 (战力数值 "99999 >> 188888" / 抽奖码) → `"99999" (数字: 9-9-9-9-9)`; 中英混排短词 ("VIP特权" / "iOS版") → `"VIP特权" (拼字: V-I-P-特-权)`; 生僻汉字 ("燚阳殿") → `(拆字: 燚-阳-殿)`; 英文 diacritic ("Müller") → `(拼字: M-ü-l-l-e-r)`。常见汉字 ("登录"/"领取") **不拆**, 拆所有字反向稀释 prompt budget。
 
-补充 STEP A 强制规则 (不在 9 条 `==== 关键规则 ====` 里, 但 system prompt 同样硬约束):
-- **[Vision Notes] 强制开头**: 每段以 `[Vision Notes]` 块开头, plain 描述每张 ref 实际看到 (反 hallucination). 辨不出主体身份就写视觉特征 placeholder, 绝不凭训练先验猜具体历史人物/franchise 角色名。
+补充 STEP A 强制规则 (不在 11 条 `==== 关键规则 ====` 里, 但 system prompt 同样硬约束):
+- **[Vision Notes] 强制开头**: 每段以 `[Vision Notes]` 块开头, plain 描述每张 ref 实际看到 (反 hallucination)。
+- **角色身份判定 OCR-only**: 辨不出主体身份就写 "<体型/性别>, <实际服装颜色与造型>" 这种视觉特征 placeholder, 绝不凭训练先验猜具体历史人物 / franchise / 动漫 / 游戏角色名。**唯二例外**: (a) 图上有清晰可读的角色名字标签可 OCR; (b) user 在原 prompt 显式指定了角色名。
+- **不能基于视觉特征推具体身份**: 服装颜色/发型/武器形状/胡须长短是题材刻板印象, 不能用来判定"这是 X 角色", 会把同 trope 的 N 张图都识别成同一角色 (case_22 实证根因)。
+- **CandidatePool 池子只能引用真实可见角色**: 池子小就池子小, 绝不允许扩充 hallucinated 角色; 不确定时用 `<视觉特征>+<placeholder>` 描述, 绝不把名字写进去。
+- **装饰元素细颗粒必须单独列**: ref 上所有**非文字视觉特征** (形状/笔触/纹理/光影/材质/构图元素) 按 ref 所见据实列, 跟文字位分开, 让下游 image_gen 复刻形态 (内容可换形态保留)。
 - **题材完全无关**: 对任何题材 (任何 IP/franchise/genre 不预设) 都按 ref vision 输出。
 
 #### Rewriter 输出格式 (中文 labeled lines, 单段示例)
+
+⚠️ **labeled lines 是 scaffolding 不是 closed schema** (跟 codex 上游 "Keep it short" 原则一致): **没信息的段整段省略**, 不要凑废话。e.g. ref 是无文字 splash → `[文字]` 段不出现; user 没指定调色板 → `[画风]` 段简短点出"沿用 ref 视觉语言"即可。agent 看 rewriter 输出**少几段不是 bug** — 是 LLM 正确判断了 specificity。
 
 ```
 # REWRITTEN-CN-V2
@@ -203,19 +227,24 @@ python scripts/rewrite_prompt.py \
 - ...
 [/Vision Notes]
 
-用途: <一句话功能用途, 自由文本不预设 enum>
+用途: <从 19 个 codex use-case slug 选最接近的; 真不 fit 才自由文本>
+  生成类: photorealistic-natural / product-mockup / ui-mockup / infographic-diagram /
+         scientific-educational / ads-marketing / productivity-visual / logo-brand /
+         illustration-story / stylized-concept / historical-scene
+  编辑类: text-localization / identity-preserve / precise-object-edit / lighting-weather /
+         background-extraction / style-transfer / compositing / sketch-to-render
 主要请求: <一句话讲这张图要什么>
 参考图角色:
   - Image 1 (<role>): <vision 看到的 + 在本段 prompt 怎么用>
   - Image 2 (<role>): <同上>
-场景/背景: <氛围 + 关键 props + 来源>
+场景/背景: <氛围 + 关键 props + 来源>     # 没信息可省略整段
 主角主体: <具体描述 + pose + 跟 ref 的关系>
 画风/介质: <从 vision 提取的笔触/材质/光影/调色板, 不写 franchise/IP/题材名>
-构图/比例/尺寸: <横/竖版 + 宽高比 + 尺寸 + 留白>
-文字 (verbatim, 字位数模仿 ref 密度, 上限 5):
+构图/比例/尺寸: <横/竖版 + 宽高比 + 尺寸 + 留白>     # ref 已定构图时简短点出即可
+文字 (verbatim, 字位数模仿 ref 密度, 上限 5):     # ref 无文字则本段省略
   - <位置 1>: "<引号内 exact verbatim>"
   - ...
-约束: <从 user 否定指令转成正向 + 通用 quality 约束>
+约束: <user 否定指令转正向 + 通用 quality + 默认 "no logos, no trademarks, no watermark">
 避免: <hallucination 黑名单: 不要拼图 / 不要 panel / 不要从 ref 复制 verbatim 文字>
 ```
 
