@@ -30,7 +30,9 @@ CLI:
 import argparse
 import base64
 import os
+import re
 import sys
+import time
 from pathlib import Path
 
 from openai import OpenAI
@@ -88,7 +90,7 @@ REWRITE_SYSTEM = f"""你是 `game-ad-imagegen` skill 内部的 prompt 重写 age
 - 可见的中文文字 (verbatim 准确抄录, 包括卡牌名/标题/角色名)
 - 在 user 需求里的角色 (composition reference / character source / style reference / edit target /
   compositing element / mask reference 等 — 优先用 user 显式描述,如 "图1构图" → composition reference)
-- **装饰元素细颗粒 (必须单独列, 不算文字位)**: ref 上所有**非文字图形装饰**——按 ref 所见据实列出, 不预设种类。任何 ref 上的图形特征 (形状/重复 motif/边框/标记/光效/材质/线条/纹理细节/构图装置 等) 都属于此类。这些是 ref 的**视觉装饰语言**, 跟文字位分开, 必须列出来让下游 image_gen 复刻图形语言 (内容可以换但形态保留)。
+- **装饰元素细颗粒 (必须单独列, 不算文字位)**: ref 上所有**非文字视觉特征**——按 ref 所见据实列出, 不预设种类。包括但不限于: ref 上可观察到的形状/笔触/纹理/光影/材质/构图元素等。这些是 ref 的**视觉语言**, 跟文字位分开, 必须列出来让下游 image_gen 复刻形态 (内容可以换但形态保留)。
 
 ==== STEP B: 构建 CandidatePool ====
 扫描所有 refs 里可用的角色/主体:
@@ -107,7 +109,7 @@ REWRITE_SYSTEM = f"""你是 `game-ad-imagegen` skill 内部的 prompt 重写 age
 - Image 2: ...
 [/Vision Notes]
 
-用途: <一句话本图的功能用途, 自由文本, 如 ads/key-visual/concept-art/character-portrait/scene-painting/photoreal/text-localization-edit/ui-mockup 等, 不限于这些>
+用途: <一句话本图的功能用途, 自由文本 — 描述这张图是干什么的, 不预设任何 enum/类别>
 主要请求: <一句话讲这张图要什么>
 参考图角色:
   - Image 1 (<role>): <vision 看到的 + 在本段 prompt 怎么用>
@@ -132,7 +134,7 @@ REWRITE_SYSTEM = f"""你是 `game-ad-imagegen` skill 内部的 prompt 重写 age
    - **字位密度高的 ref 也别超 5**: ref 上有 8-10 字位的密集广告 → 输出截到 ≤5 个最关键字位 (优先 user 显式指定的 > ref 主标题 > ref 次标题, 其他略)
   每个保留字位填什么:
    - (a) user 显式指定的字 (`宣传语="..."` / 标题 / 副标语) → verbatim
-   - (b) ref 上有字位但 user 没指定内容 → 按 ref 字位的**语义角色**填 user 主角对应内容 (ref 那位置原是角色名 → user 主角名; ref 那位置原是定位/技能 → user 主角对应定位; ref 那位置原是品类 slogan → 保留性质微调)
+   - (b) ref 上有字位但 user 没指定内容 → 按 ref 字位的**语义功能**填对应内容 (ref 上原是 X 类信息 → 当前主角 X 类信息; ref 上原是品类/通用 slogan → 保留语义微调). 具体语义类型由 vision 实际识别决定, 不预设
 3. **删 user prompt 的批量控制语言**: "分别" / "5 张" / "做 N 张" / "分两排" 这些不是视觉指令,是告诉你产几段。**不要 echo 进任何 prompt**。
 4. **Verbatim**: 每个文字位的内容写引号内 exact verbatim (中文/英文/数字皆可)。永远不要含糊地说"主题文字"/"slogan 类的文案" — 会被 image model hallucinate。如果某位置 ref 上没字, 该位置直接**不写进 [文字] 段**即可 (不需要写"留空")。
 5. **Series variety when N>1 (非 anchor phase3)**: 每段不同 primary character (来自 CandidatePool),不要 N 段全是同一个角色的细微变体。
@@ -218,8 +220,7 @@ def rewrite(user_prompt: str, reference_images, n: int = 1,
         raise ValueError(f"n must be >= 1, got {n}")
 
     # Strip prompt_zh.md YAML frontmatter (---\n...\n---\n), 不吞正文里的 "---" 分隔线
-    # 之前用 `split("---", 1)[-1]` 太广, 正文写 `---` 或 markdown horizontal rule 会被吞前半段
-    _frontmatter_pat = __import__("re").compile(r"\A---\s*\n.*?\n---\s*\n", __import__("re").DOTALL)
+    _frontmatter_pat = re.compile(r"\A---\s*\n.*?\n---\s*\n", re.DOTALL)
     user_prompt = _frontmatter_pat.sub("", user_prompt, count=1).strip()
 
     base_url, api_key = _load_credentials()
@@ -272,33 +273,58 @@ def rewrite(user_prompt: str, reference_images, n: int = 1,
         {"role": "system", "content": REWRITE_SYSTEM},
         {"role": "user", "content": user_content},
     ]
-    try:
-        response = client.chat.completions.create(
-            model=model, messages=msgs, extra_body={"reasoning_effort": "medium"},
-        )
-    except Exception as e:
-        # 检测"模型不支持 reasoning_effort 参数"的 400 错误, fallback 不带这个 extra_body 重试.
-        # 优先用结构化检查 (HTTP status + error.param), 字串匹配仅做兜底.
-        is_reasoning_unsupported = False
+    # transient retry (429/500/502/503/504/网络) + reasoning_effort fallback.
+    # rewrite 调用也 ¥-cost (model gpt-5.4), 一次 502 不应直接杀整批 (跟 image_gen_hybrid
+    # 的 _TRANSIENT_STATUSES + 2-step backoff 一致, round-4 blind #6 抓).
+    _TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
+    _RETRY_BACKOFF_SEC = [5, 15]
+    attempts = [0] + _RETRY_BACKOFF_SEC
+    use_reasoning = True
+    response = None
+    last_exc = None
+    for attempt_idx, sleep_before in enumerate(attempts):
+        if sleep_before > 0:
+            print(f"  [rewrite-cn] retry attempt {attempt_idx + 1}/{len(attempts)} after {sleep_before}s...", file=sys.stderr, flush=True)
+            time.sleep(sleep_before)
         try:
-            # OpenAI SDK BadRequestError 暴露 .status_code + .body['error']['param']
-            status = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
-            body = getattr(e, "body", None) or {}
-            err_param = (body.get("error") or {}).get("param") if isinstance(body, dict) else None
-            if status == 400 and err_param and "reasoning" in str(err_param).lower():
-                is_reasoning_unsupported = True
-        except Exception:
-            pass
-        if not is_reasoning_unsupported:
-            # 兜底: 字串匹配 (针对非 OpenAI 兼容端点不暴露结构化字段的情况)
-            emsg = str(e).lower()
-            if "reasoning" in emsg and any(s in emsg for s in ("unknown", "unsupported", "invalid", "400")):
-                is_reasoning_unsupported = True
-        if is_reasoning_unsupported:
-            print(f"  [rewrite-cn] WARN: model={model} 不支持 reasoning_effort, fallback to no-reasoning retry", file=sys.stderr, flush=True)
-            response = client.chat.completions.create(model=model, messages=msgs)
-        else:
+            kwargs = {"model": model, "messages": msgs}
+            if use_reasoning:
+                kwargs["extra_body"] = {"reasoning_effort": "medium"}
+            response = client.chat.completions.create(**kwargs)
+            break
+        except Exception as e:
+            last_exc = e
+            # 检测"模型不支持 reasoning_effort"的 400 — 切到 no-reasoning 重试 (不算 transient retry)
+            is_reasoning_unsupported = False
+            try:
+                status = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
+                body = getattr(e, "body", None) or {}
+                err_param = (body.get("error") or {}).get("param") if isinstance(body, dict) else None
+                if status == 400 and err_param and "reasoning" in str(err_param).lower():
+                    is_reasoning_unsupported = True
+            except Exception:
+                pass
+            if not is_reasoning_unsupported:
+                emsg = str(e).lower()
+                if "reasoning" in emsg and any(s in emsg for s in ("unknown", "unsupported", "invalid", "400")):
+                    is_reasoning_unsupported = True
+            if is_reasoning_unsupported and use_reasoning:
+                print(f"  [rewrite-cn] WARN: model={model} 不支持 reasoning_effort, fallback to no-reasoning", file=sys.stderr, flush=True)
+                use_reasoning = False
+                # 立即不带 backoff 重试一次 (这次切到 no-reasoning)
+                try:
+                    response = client.chat.completions.create(model=model, messages=msgs)
+                    break
+                except Exception as e2:
+                    last_exc = e2  # 落到下一轮 transient retry
+            # 判断是否是 transient: HTTP status code in _TRANSIENT_STATUSES
+            status = getattr(last_exc, "status_code", None) or getattr(getattr(last_exc, "response", None), "status_code", None)
+            if status in _TRANSIENT_STATUSES:
+                continue  # 下一轮 backoff
+            # 非 transient 直接抛
             raise
+    if response is None:
+        raise last_exc if last_exc else RuntimeError("rewrite-cn unknown failure after retries")
 
     text = _strip_fence(response.choices[0].message.content or "")
 
