@@ -194,29 +194,77 @@ def render(out_dir: Path, batch_id: str, anchor_pending_tasks: list) -> Path:
     word-break: break-all;
     white-space: pre-wrap;
   }}
+
+  /* Warning banner — 顶部红色边框警告,把 "本页不会自动提交" 这件事打到 user 脸上 */
+  .warning-banner {{
+    margin: 0 0 20px;
+    padding: 14px 18px;
+    background: #fef2f2;
+    border: 2px solid #dc2626;
+    border-left-width: 6px;
+    border-radius: 6px;
+    color: #7f1d1d;
+    font-size: 13px;
+    line-height: 1.7;
+  }}
+  .warning-banner .warning-title {{
+    font-weight: 700;
+    font-size: 15px;
+    margin-bottom: 6px;
+    color: #b91c1c;
+  }}
+  .warning-banner .warning-body code {{
+    background: #fff;
+    padding: 1px 6px;
+    border-radius: 3px;
+    border: 1px solid #fca5a5;
+    color: #7f1d1d;
+    font-size: 12px;
+  }}
+  .warning-banner .warning-body b {{ color: #991b1b; }}
+
+  /* Verify button — 落盘验证成功时变绿,失败时变红 */
+  .submit-area button.verify {{ background: #6b7280; }}
+  .submit-area button.verify:hover {{ background: #4b5563; }}
+  .submit-area button.verify.ok {{ background: #16a34a; }}
+  .submit-area button.verify.ok:hover {{ background: #15803d; }}
+  .submit-area button.verify.fail {{ background: #dc2626; }}
+  .submit-area button.verify.fail:hover {{ background: #b91c1c; }}
 </style>
 </head>
 <body>
 
 <h1>📋 Anchor Pick — batch <code>{escape(batch_id)}</code></h1>
 <div class="meta">
-  Phase 1 已跑完候选,**请为每个 task 挑选 1 张作为系列广告的 anchor**(其余 N-1 张会以该 anchor 为风格锁继续生成)。<br>
-  挑完点底部「生成 JSON」,把 JSON 保存到 <code>{escape(picks_file_name)}</code> (跟本 HTML 同目录),batch_runner 自动接力跑 Phase 3。
+  Phase 1 已跑完候选,**请为每个 task 挑选 1 张作为系列广告的 anchor**(其余 N-1 张会以该 anchor 为风格锁继续生成)。
+</div>
+
+<div class="warning-banner">
+  <div class="warning-title">⚠️ 重要:radio 点中 ≠ 已提交</div>
+  <div class="warning-body">
+    本页是<b>纯前端 HTML</b>,挑选后必须执行最后一步把 JSON <b>真正写到磁盘文件</b> <code>{escape(picks_file_name)}</code>,batch_runner 才会接续 Phase 3。<br>
+    正确流程:<b>ⓐ</b> 给每个 task 挑一张 → <b>ⓑ</b> 点「📋 复制 PowerShell 命令(推荐)」 → <b>ⓒ</b> 到 terminal 粘贴 + Enter → <b>ⓓ</b> 点「✅ 验证已落盘」确认。<br>
+    <b>不要只点「复制 JSON」就走</b> — 那只把 JSON 字符串放进剪贴板,文件没生成。
+  </div>
 </div>
 
 <form id="pickForm"></form>
 
 <div class="submit-area">
-  <button type="button" id="genJson">📝 生成 picks JSON</button>
-  <button type="button" id="downloadBtn" class="secondary" disabled>💾 下载 JSON 文件</button>
-  <button type="button" id="copyBtn" class="secondary" disabled>📋 复制到剪贴板</button>
+  <div style="margin-bottom: 10px; font-weight: 600; font-size: 13px; color: #374151;">
+    挑完后请走以下 4 步任一组合(推荐 ⓑ → ⓒ → ⓓ):
+  </div>
+  <button type="button" id="copyPsBtn" disabled>📋 ⓑ 复制 PowerShell 命令(推荐,自动落盘)</button>
+  <button type="button" id="downloadBtn" class="secondary" disabled>💾 备选:下载 JSON 文件(需自己 move 到本目录)</button>
+  <button type="button" id="copyBtn" class="secondary" disabled>📋 备选:复制 JSON 文本(需自己粘到文件)</button>
+  <button type="button" id="verifyBtn" class="verify" disabled>✅ ⓓ 验证已落盘</button>
   <span id="status" style="margin-left:12px;color:#6b7280;font-size:12px;"></span>
 
   <pre id="jsonOut"></pre>
 
-  <details>
-    <summary>📂 不想下载/移动文件?Submit 后用 PowerShell 一行落盘(下方动态生成,含你实际挑选的 picks)</summary>
-    <code id="psCmd" style="display:none">(先点上面「📝 生成 picks JSON」)</code>
+  <details open>
+    <summary>📂 PowerShell 一行命令预览(点 ⓑ 自动复制,也可手动选中复制)</summary>
+    <code id="psCmd" style="display:none">(先在上面挑选候选)</code>
   </details>
 </div>
 
@@ -303,9 +351,15 @@ TASKS.forEach((task) => {{
 const jsonOut = document.getElementById('jsonOut');
 const downloadBtn = document.getElementById('downloadBtn');
 const copyBtn = document.getElementById('copyBtn');
+const copyPsBtn = document.getElementById('copyPsBtn');
+const verifyBtn = document.getElementById('verifyBtn');
 const statusEl = document.getElementById('status');
+const psCmd = document.getElementById('psCmd');
 
-document.getElementById('genJson').addEventListener('click', () => {{
+// 全 task 都挑选完 → 自动生成 picks JSON + PowerShell 命令,启用所有"落盘"按钮
+// (旧 UX 让 user 先点「生成 JSON」再选落盘方式,user 容易跳步 / 误以为完成。
+//  新 UX 挑完即生成,落盘按钮高亮,验证按钮等落盘后绿灯)
+function _regenerateOnPick() {{
   const picks = {{}};
   let missing = [];
   TASKS.forEach((t) => {{
@@ -317,29 +371,46 @@ document.getElementById('genJson').addEventListener('click', () => {{
     }}
   }});
   if (missing.length) {{
-    statusEl.textContent = `⚠️ 还有 ${{missing.length}} 个 task 没挑选: ${{missing.join(', ')}}`;
-    statusEl.style.color = '#dc2626';
+    // 还没挑完 → 维持原状(按钮 disabled / status 不变)
     return;
   }}
   const jsonText = JSON.stringify(picks, null, 2);
   jsonOut.textContent = jsonText;
   jsonOut.classList.add('show');
+  copyPsBtn.disabled = false;
   downloadBtn.disabled = false;
   copyBtn.disabled = false;
-  statusEl.textContent = `✅ JSON 已生成 (${{Object.keys(picks).length}} 个 picks)。`;
+  verifyBtn.disabled = false;
+  statusEl.textContent = `✅ 挑选完成 (${{Object.keys(picks).length}} picks) — 现在请点「📋 ⓑ 复制 PowerShell 命令」走 ⓒⓓ。`;
   statusEl.style.color = '#16a34a';
   window._currentJsonText = jsonText;
 
-  // 动态更新 PowerShell 一行命令(含实际 picks),user 可选复制粘贴到 terminal
-  // PS here-string @'...'@ 里 ' 字面要写成 '' (single → double single quote)
-  const psCmd = document.getElementById('psCmd');
+  // PowerShell here-string @'...'@ 里 ' 字面要写成 '' (单引号 → 双单引号)
   const jsonForPS = jsonText.replace(/'/g, "''");
   const psBody = '$json = @\\'\\n' + jsonForPS + '\\n\\'@ ; Set-Content -LiteralPath \\'' +
                  PICKS_FILE_FULL_PATH + '\\' -Value $json -Encoding utf8';
   psCmd.textContent = psBody;
   psCmd.style.display = 'block';
+}}
+
+// 监听所有 radio 改变,挑完自动 regenerate
+form.addEventListener('change', _regenerateOnPick);
+
+// ⓑ 复制 PowerShell 命令 — 推荐落盘方式 (自动落盘到正确路径)
+copyPsBtn.addEventListener('click', async () => {{
+  const psBody = psCmd.textContent;
+  if (!psBody || psBody.startsWith('(')) return;
+  try {{
+    await navigator.clipboard.writeText(psBody);
+    statusEl.textContent = `📋 PowerShell 命令已复制 — 请到 terminal 粘贴 + 按 Enter,然后回来点「✅ ⓓ 验证已落盘」。`;
+    statusEl.style.color = '#2563eb';
+  }} catch (e) {{
+    statusEl.textContent = `❌ 自动复制失败 (${{e.message}}) — 请手动选中下方 PowerShell 命令文本复制。`;
+    statusEl.style.color = '#dc2626';
+  }}
 }});
 
+// 备选 ⓑ': 下载 JSON 文件
 downloadBtn.addEventListener('click', () => {{
   if (!window._currentJsonText) return;
   const blob = new Blob([window._currentJsonText], {{ type: 'application/json;charset=utf-8' }});
@@ -351,16 +422,58 @@ downloadBtn.addEventListener('click', () => {{
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
-  statusEl.textContent = `💾 已下载到 Downloads — 把 ${{PICKS_FILE}} 移到本 HTML 同目录即可。`;
+  statusEl.textContent = `💾 已下载到 Downloads — 把 ${{PICKS_FILE}} 移到本 HTML 同目录后,点「✅ ⓓ 验证」。`;
+  statusEl.style.color = '#2563eb';
 }});
 
+// 备选 ⓑ'': 复制 JSON 文本(user 需要自己粘到文件)
 copyBtn.addEventListener('click', async () => {{
   if (!window._currentJsonText) return;
   try {{
     await navigator.clipboard.writeText(window._currentJsonText);
-    statusEl.textContent = `📋 JSON 已复制到剪贴板。粘贴到 ${{PICKS_FILE}} 文件即可。`;
+    statusEl.textContent = `📋 JSON 已复制 — 请创建文件 ${{PICKS_FILE}} 粘贴内容,然后点「✅ ⓓ 验证」。`;
+    statusEl.style.color = '#2563eb';
   }} catch (e) {{
     statusEl.textContent = `❌ 复制失败: ${{e.message}} — 请手动选中 JSON 文本复制。`;
+    statusEl.style.color = '#dc2626';
+  }}
+}});
+
+// ⓓ 验证已落盘 — fetch 试读同目录 PICKS_FILE
+// file:// 协议在 Chrome 默认拦 fetch (CORS),Firefox 默认允许同目录读;
+// 拦截时给 user fallback 文案 (PowerShell Test-Path 一行 verify) — 不闭环但比静默好
+verifyBtn.addEventListener('click', async () => {{
+  if (!window._currentJsonText) return;
+  verifyBtn.classList.remove('ok', 'fail');
+  statusEl.textContent = `⏳ 验证中...`;
+  statusEl.style.color = '#6b7280';
+  try {{
+    const resp = await fetch(PICKS_FILE, {{cache: 'no-store'}});
+    if (!resp.ok) throw new Error(`HTTP ${{resp.status}}`);
+    const actualText = await resp.text();
+    const actualJson = JSON.parse(actualText);
+    const expectedJson = JSON.parse(window._currentJsonText);
+    // 对比 keys + values
+    const keysOK = JSON.stringify(Object.keys(actualJson).sort()) === JSON.stringify(Object.keys(expectedJson).sort());
+    const valuesOK = Object.keys(expectedJson).every(k => parseInt(actualJson[k], 10) === parseInt(expectedJson[k], 10));
+    if (keysOK && valuesOK) {{
+      verifyBtn.classList.add('ok');
+      verifyBtn.textContent = '✅ 已落盘且内容一致';
+      statusEl.textContent = `🎉 picks.json 已确认落盘,batch_runner 30s 内会发现并接续 Phase 3 (如果还在 poll)。`;
+      statusEl.style.color = '#16a34a';
+    }} else {{
+      verifyBtn.classList.add('fail');
+      verifyBtn.textContent = '⚠️ 文件存在但内容不一致';
+      statusEl.textContent = `⚠️ 文件存在但 picks 跟当前选择不一致 — 可能是旧 picks。请重新点 ⓑⓒ 落盘最新选择。`;
+      statusEl.style.color = '#dc2626';
+    }}
+  }} catch (e) {{
+    verifyBtn.classList.add('fail');
+    verifyBtn.textContent = '❌ 验证失败';
+    // file:// CORS 拦时 fetch 抛 TypeError;给一行 PS 让 user 自己 verify
+    statusEl.innerHTML = `❌ 自动验证不可用 (浏览器 file:// 限制,${{e.message}})。请到 terminal 跑: ` +
+                         `<code style="background:#fff;padding:1px 4px;border:1px solid #fca5a5;border-radius:3px">Test-Path '${{PICKS_FILE_FULL_PATH}}'</code> 看是否 True。`;
+    statusEl.style.color = '#dc2626';
   }}
 }});
 </script>
