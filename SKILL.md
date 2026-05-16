@@ -189,14 +189,21 @@ rewriter 不是无脑展开 — **根据 user prompt 具体程度调整 augmenta
 
 **允许加** (Allowed): composition / framing 提示 / polish level / intended-use / 实用 layout / 支持已述请求的场景具体化。
 
-> agent 排错时如果发现 rewriter 输出"加了 user 没要求的细节"或"对 detail prompt 还在过度展开", 看这里是否违反, 用 user 原话 + Specificity 段反向 prompt 改 rewriter。
+**不算 augmentation (是 normalization / structural enforcement, detail prompt 也注入)**:
+- Rule 10 默认约束 (`no logos, no trademarks, no watermark` / use-case-specific defaults)
+- anchor phase3 LOCK 句 (`严格匹配 Image N 的渲染风格...`)
+- 反 hallucination 黑名单 ([Vision Notes] 块 / 不复制 ref verbatim 文字)
+- edit invariants (`change only X; keep Y unchanged`)
+- Rule 11 letter-by-letter 拆字注释 (image model spelling hint)
+
+> agent 排错时如果发现 rewriter 输出"加了 user 没要求的细节"或"对 detail prompt 还在过度展开", 看是否违反 "禁加" 列表 (而不是上面 5 条 normalization)。后者跟 specificity 无关, 永远注入。
 
 #### rewriter 内部规则 (跟 `rewrite_prompt.py REWRITE_SYSTEM` 1:1)
 
 下方 11 条规则跟 rewriter system prompt `==== 关键规则 ====` 段 1:1 对齐 (顺序 + 编号同步)。**agent 不需要自己手抄这些规则手写 prompt** — rewriter LLM 已经按这些规则跑。贴在这里供 agent 排错 / 解释 rewriter 输出。完整规则见 `rewrite_prompt.py:REWRITE_SYSTEM`。
 
 1. **构图复刻 ref 实际形态**: 主体数量 + 版式按 ref vision 看到 — 单主体就单主体, 群像就群像, 分镜/拼图就照 ref. **不预设主体数量上限**, 也不预设 single/multi panel 偏好。
-2. **字位数量模仿 ref 字位密度**: 上限 5, 下限 = ref 实际字位数 (ref 0 字位则不渲染任何文字; ref 字位密集则截到 ≤5 个最关键). 字位语义功能跟 ref 一致 (ref 上原是 X 类信息 → 当前主体 X 类信息), 不预设具体字位类型。
+2. **字位数量模仿 ref 字位密度**: **默认上限 5**, 下限 = ref 实际字位数 (ref 0 字位则不渲染任何文字; ref 字位密集则截到 ≤5 个最关键). 字位语义功能跟 ref 一致 (ref 上原是 X 类信息 → 当前主体 X 类信息), 不预设具体字位类型。**edit use case 行为豁免 (跟 Rule 10 同步)**: 若 user 任务是 "保留 ref 全部字位只改其中一两个" 的 edit (信号 = "其他不变" / "保留原 UI" / "只改 X"), **默认 5 上限失效, 改用 "字位数 = ref 实际字位数 (无上限)"**, 防跟 Rule 10 "no extra text" 互锁让 model 删 ref 既有字位。
 3. **删 user prompt 的批量控制语言**: "分别 / N 张 / 分两排" 这些是告诉 rewriter 产几段, 不是视觉指令, 不 echo 进任何 prompt。
 4. **Verbatim**: 每字位写 `<位置>: "<exact 字面>"`. 永远不要含糊地说"主题文字"否则被 image model hallucinate。ref 上没字位则不写进 [文字] 段 (不写"留空")。
 5. **Series variety when N>1 (非 anchor phase3)**: 每段不同 primary subject (来自 CandidatePool), 不要 N 段全是同一主体的细微变体。
@@ -204,7 +211,7 @@ rewriter 不是无脑展开 — **根据 user prompt 具体程度调整 augmenta
 7. **Image role 显式 label**: 每张 ref 在 [参考图角色] 段显式 label 它的 role (composition reference / character source / style reference / edit target 等, 自由文本), 不 collapse 二分。Ref 顺序按 user "图1/图2/..."语义。
 8. **Edit mode 显式 invariants**: 若 user "改 X 其余不变", 约束必须含 "change only X; keep everything else (layout/typography/colors/composition/background) unchanged"。
 9. **复刻 ref 视觉特征 + 不复制 ref 文字 verbatim**: 避免段**只禁文字 verbatim**, 视觉特征 (按 [Vision Notes] 列出) 必须复刻形态。绝不能扩成"不要复制 ref 上的任何视觉元素"过广避免, 会让出图比 ref 简陋。
-10. **默认约束** (跟 codex 上游 sample-prompts 13 个 recipe 默认带的一致): 每段 [约束] 段必须含 `no logos, no trademarks, no watermark` (通用); `no extra text outside [文字] section` (**text-localization / identity-preserve / precise-object-edit 等保留 ref 全部既有字位的 edit use case 时本项失效**, logo-brand / wordmark 等文字本身就是主体的 use case 也豁免); photorealistic-natural 加 `no studio polish, no staged look`; ui-mockup / infographic-diagram 加 `clear hierarchy, readable typography`。**anchor_phase=phase3 时本 Rule 全部 use-case-specific 默认约束失效, 以 picked anchor 实际渲染风格为准** (`no logos/watermark` 通用项 + edit 豁免仍生效)。
+10. **默认约束** (跟 codex 上游 sample-prompts 13 个 recipe 默认带的一致): 每段 [约束] 段必须含 `no logos, no trademarks, no watermark` (通用); `no extra text outside [文字] section` — **行为定义豁免** (替代之前 slug 白名单, 防漏 slug): 若 user 任务是 "改 X 不动其余字位" 的 edit 场景 (任何 edit slug 都可能命中, 信号 = "其他不变" / "保留原 UI" / "只改 X"), 本项失效, 改用 `change only <X>; keep all other text verbatim`; logo-brand (含 wordmark / 字体本身为主体) 同样豁免。**跟 Rule 2 字位上限豁免同步**。photorealistic-natural 加 `no studio polish, no staged look`; ui-mockup / infographic-diagram 加 `clear hierarchy, readable typography`。**anchor_phase=phase3 时本 Rule 全部 use-case-specific 默认约束失效, 以 picked anchor 实际渲染风格为准** (`no logos/watermark` 通用项 + edit "改 X 不动其余" 豁免仍生效)。
 11. **生僻字 / 中英混排 / 长数字串 letter-by-letter 处理** (按 game-ad 命中频率排序): 长数字 ≥5 位 (战力数值 "99999 >> 188888" / 抽奖码) → `"99999" (数字: 9-9-9-9-9)`; 中英混排短词 ("VIP特权" / "iOS版") → `"VIP特权" (拼字: V-I-P-特-权)`; 生僻汉字 ("燚阳殿") → `(拆字: 燚-阳-殿)`; 英文 diacritic ("Müller") → `(拼字: M-ü-l-l-e-r)`。常见汉字 ("登录"/"领取") **不拆**, 拆所有字反向稀释 prompt budget。
 
 补充 STEP A 强制规则 (不在 11 条 `==== 关键规则 ====` 里, 但 system prompt 同样硬约束):
@@ -217,7 +224,9 @@ rewriter 不是无脑展开 — **根据 user prompt 具体程度调整 augmenta
 
 #### Rewriter 输出格式 (中文 labeled lines, 单段示例)
 
-⚠️ **labeled lines 是 scaffolding 不是 closed schema** (跟 codex 上游 "Keep it short" 原则一致): **没信息的段整段省略**, 不要凑废话。e.g. ref 是无文字 splash → `[文字]` 段不出现; user 没指定调色板 → `[画风]` 段简短点出"沿用 ref 视觉语言"即可。agent 看 rewriter 输出**少几段不是 bug** — 是 LLM 正确判断了 specificity。
+⚠️ **labeled lines 是 scaffolding 不是 closed schema** (跟 codex 上游 "Keep it short" 原则一致): 一段 prompt 内 **没信息的 labeled line 整段省略**, 不要凑废话。e.g. ref 是无文字 splash → `[文字]` line 不出现; user 没指定调色板 → `[画风]` line 简短点出"沿用 ref 视觉语言"即可。agent 看 rewriter 输出的一段 prompt **少几个 labeled line 不是 bug** — 是 LLM 正确判断了 specificity。
+
+> **澄清** (round-7 G1 fix): 这里"段省略"指**段内**的 labeled lines (10 段 scaffolding 之一可省). **N 段独立 prompt 仍必须 N 段齐全** (n=5 时 rewriter 必须返 5 段 self-contained prompt, 缺 1 段 rewriter 会 raise RuntimeError 而不是 silent pad). 两个层级不能混。
 
 ```
 # REWRITTEN-CN-V2
@@ -526,9 +535,12 @@ Phase 2: poll `{batch_id}_anchor_picks.json` (30s/round, timeout 30min);user 浏
 Phase 3: copied picked → `{task_id}_01.png` + rewrite N-1 段 anchor-locked → 跑 N-1 张 series
 ```
 
-**🚨 Phase 3 主角身份 LOCK** (hybrid path 反转旧 main bug):
-- 旧 main 路径 Phase 3 描述 "angle/sidekick may vary" 实际让**主角身份**也 vary (实测旧版 series 跨张主角变成完全不同的另一个角色)
-- hybrid path 改为**主角身份严格 LOCK**: N-1 段 rewrite 都跟 picked anchor 保持同一主角, 只 vary pose/scene/小道具. 这条 invariant 写在 `rewrite_prompt.py` anchor_phase="phase3" 段的 system prompt 里
+**🚨 Phase 3 三个 LOCK** (hybrid path 反转旧 main bug + round-6 补完):
+- **主角身份 LOCK**: 旧 main 路径 Phase 3 描述 "angle/sidekick may vary" 实际让主角身份也 vary (实测旧版 series 跨张主角变成完全不同的另一个角色). hybrid path 改为**主角身份严格 LOCK**, N-1 段 rewrite 都跟 picked anchor 保持同一主角, 只 vary pose/scene/小道具.
+- **字位密度 LOCK** (round-6 R6-5): N-1 段 [文字] 段密度跟 picked anchor 实际渲染的字位数对齐 (anchor 是无文字 splash → N-1 段也不渲染文字; anchor 有 3 字位 → N-1 段也维持 3 字位; 防 phase1 anchor 空文字而 phase3 自由发挥加字位).
+- **use-case 默认约束失效** (round-6 R6-2): Rule 10 里 photorealistic-natural 的 "no studio polish" / ui-mockup 的 "clear hierarchy" 等 use-case-specific 默认约束在 phase3 **全部失效**, 以 picked anchor 实际渲染风格为准 (anchor 本就 studio polish 时 phase3 不该再反约束). 通用 `no logos/trademarks/watermark` + edit "改 X 不动其余" 豁免仍生效.
+
+三个 LOCK 都 codify 在 `rewrite_prompt.py` anchor_phase="phase3" 段 system prompt + Rule 10 末项里。
 
 **🚨 Phase 2 — agent 绝对不能代办**:
 
@@ -579,6 +591,7 @@ agent 看到 `_batch_meta.json` 内 `status="awaiting_picks"` = 等用户挑选�
 | 现象 | 诊断 | 处理 |
 |---|---|---|
 | image_gen HTTP 4xx/5xx | API key 无效 / 配额耗尽 / 参考图过大 | 检查 EPHONE_API_KEY；缩小参考图 |
+| `[rewrite-cn] WARN: model={model} 不支持 reasoning_effort, fallback to no-reasoning` | rewrite 模型不支持 `reasoning_effort` 参数 (e.g. 直连 OpenAI 用 gpt-4o 而非 gpt-5.4) | 正常 fallback,**不消耗 transient retry 预算** (R7-2: insert 0-sleep + pop 尾部 sleep slot 保净 budget=3 不变), 输出质量略降但不阻塞 batch |
 | 图片字体单薄 / 错位 | 走错路线了，不要做 Pillow 后期叠字！ | 检查 Step 4 prompt 里是否误加了"留白"指令；image_gen 必须一次性画字 |
 | 输出图过度像参考图（人物特征 ≈ 参考图人物变体） | 参考图过度复刻：prompt 不够具体 | 强化 Step 4 的"角色身份从 Step 1 PerImageNotes 实际看到的图源取"约束 |
 | N 张序列视觉风格不一致 | 没把所有参考图都传给每次调用 | 简单循环模式：每次 `--refs <所有用户参考图>` 全传；走 Phase 1 老接口的话 `anchor_strategy="first"` |

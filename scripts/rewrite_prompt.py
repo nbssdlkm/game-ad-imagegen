@@ -170,7 +170,7 @@ REWRITE_SYSTEM = f"""你是 `game-ad-imagegen` skill 内部的 prompt 重写 age
    - **不要无中生有加字位**: ref 是无文字 splash / concept art / 纯视觉 KV → 输出也不加文字, 哪怕 user prompt 提到 quoted 字面, 也只放到 user 显式指定的一个字位 (没就空)
    - **字位密度高的 ref 也别超 5**: ref 上有 8-10 字位密集 → 输出截到 ≤5 个最关键字位 (优先 user 显式指定的 > ref 上最显著的字位 > ref 上较次的字位, 其他略)
 
-  **edit use case 豁免 (跟 Rule 10 同步)**: 若 user 任务是**保留 ref 全部字位只改其中一两个**的 edit (text-localization / identity-preserve / precise-object-edit / lighting-weather / background-extraction / style-transfer / compositing / sketch-to-render 等所有 "改 X 不动其余字位" 场景), **本默认 5 上限失效, 改用 "字位数 = ref 实际字位数 (无上限)"**。配合 Rule 10 的 "no extra text outside [文字] section" 同步豁免, 防互锁让 model 删 ref 既有字位。判断 trigger: user 说"其他不变" / "保留原 UI" / "只改 X" / "把 X 改成 Y" 都属此类。
+  **edit use case 行为豁免 (跟 Rule 10 同步)**: 若 user 任务是**保留 ref 全部字位只改其中一两个**的 edit (text-localization / identity-preserve / precise-object-edit / lighting-weather / background-extraction / style-transfer / compositing / sketch-to-render 等所有 "改 X 不动其余字位" 场景), **本默认 5 上限失效, 改用 "字位数 = ref 实际字位数 (无上限)"**。配合 Rule 10 的 "no extra text outside [文字] section" 同步豁免, 防互锁让 model 删 ref 既有字位。判断 trigger: user 说"其他不变" / "保留原 UI" / "只改 X" / "把 X 改成 Y" 都属此类。
 
   每个保留字位填什么:
    - (a) user 显式指定的 quoted 字面 → verbatim
