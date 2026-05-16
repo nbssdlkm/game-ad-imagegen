@@ -228,9 +228,10 @@ def rewrite(user_prompt: str, reference_images, n: int = 1,
     if n < 1:
         raise ValueError(f"n must be >= 1, got {n}")
 
-    # Strip prompt_zh.md metadata header
-    if "---" in user_prompt:
-        user_prompt = user_prompt.split("---", 1)[-1].strip()
+    # Strip prompt_zh.md YAML frontmatter (---\n...\n---\n), 不吞正文里的 "---" 分隔线
+    # 之前用 `split("---", 1)[-1]` 太广, 正文写 `---` 或 markdown horizontal rule 会被吞前半段
+    _frontmatter_pat = __import__("re").compile(r"\A---\s*\n.*?\n---\s*\n", __import__("re").DOTALL)
+    user_prompt = _frontmatter_pat.sub("", user_prompt, count=1).strip()
 
     base_url, api_key = _load_credentials()
     client = OpenAI(api_key=api_key, base_url=base_url, timeout=DEFAULT_TIMEOUT)
@@ -287,9 +288,25 @@ def rewrite(user_prompt: str, reference_images, n: int = 1,
             model=model, messages=msgs, extra_body={"reasoning_effort": "medium"},
         )
     except Exception as e:
-        emsg = str(e).lower()
-        if "reasoning" in emsg and any(s in emsg for s in ("unknown", "unsupported", "invalid", "400")):
-            print(f"  [rewrite-cn] WARN: model={model} 不支持 reasoning_effort, fallback default", file=sys.stderr, flush=True)
+        # 检测"模型不支持 reasoning_effort 参数"的 400 错误, fallback 不带这个 extra_body 重试.
+        # 优先用结构化检查 (HTTP status + error.param), 字串匹配仅做兜底.
+        is_reasoning_unsupported = False
+        try:
+            # OpenAI SDK BadRequestError 暴露 .status_code + .body['error']['param']
+            status = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
+            body = getattr(e, "body", None) or {}
+            err_param = (body.get("error") or {}).get("param") if isinstance(body, dict) else None
+            if status == 400 and err_param and "reasoning" in str(err_param).lower():
+                is_reasoning_unsupported = True
+        except Exception:
+            pass
+        if not is_reasoning_unsupported:
+            # 兜底: 字串匹配 (针对非 OpenAI 兼容端点不暴露结构化字段的情况)
+            emsg = str(e).lower()
+            if "reasoning" in emsg and any(s in emsg for s in ("unknown", "unsupported", "invalid", "400")):
+                is_reasoning_unsupported = True
+        if is_reasoning_unsupported:
+            print(f"  [rewrite-cn] WARN: model={model} 不支持 reasoning_effort, fallback to no-reasoning retry", file=sys.stderr, flush=True)
             response = client.chat.completions.create(model=model, messages=msgs)
         else:
             raise
@@ -309,11 +326,15 @@ def rewrite(user_prompt: str, reference_images, n: int = 1,
         raise RuntimeError(f"rewrite-cn 无法 parse (n={n}>=2 但没找到 PROMPT_SEP): {snippet!r}")
 
     if len(parts) < n:
-        print(f"  [rewrite-cn] WARN: 期望 {n} 段, 得 {len(parts)} 段, 用最后一段 pad", file=sys.stderr, flush=True)
-        while len(parts) < n:
-            parts.append(parts[-1])
-    elif len(parts) > n:
-        print(f"  [rewrite-cn] WARN: 期望 {n} 段, 得 {len(parts)} 段, 截断", file=sys.stderr, flush=True)
+        # 之前用 "重复最后一段 pad" silently fix → 失 series variety + WARN 容易被 batch_runner 吞.
+        # 改 raise 让 runner 决定 retry / 报 user, 不静默掩盖 LLM 输出问题.
+        snippet = "\n---\n".join(p[:120] for p in parts)
+        raise RuntimeError(
+            f"rewrite-cn 期望 {n} 段, LLM 只返 {len(parts)} 段. 建议: 检查 system prompt 是否要求"
+            f"明确 N 段输出 / 增大 max_tokens / 让 user retry. 已得 {len(parts)} 段 preview:\n{snippet}"
+        )
+    if len(parts) > n:
+        print(f"  [rewrite-cn] WARN: 期望 {n} 段, LLM 返 {len(parts)} 段, 截断到前 {n}", file=sys.stderr, flush=True)
         parts = parts[:n]
 
     return [_wrap_with_sentinel(p) for p in parts]
