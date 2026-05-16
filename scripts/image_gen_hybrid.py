@@ -78,8 +78,14 @@ def _read_actual_size(png_path: Path) -> tuple[int, int] | None:
         return None
 
 
+_TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
+_RETRY_BACKOFF_SEC = [5, 15]  # 2 次 retry,5s 后 + 15s 后. image gen 单调用 ¥0.1+ 不浪费
+
+
 def call_responses(prompt_cn: str, refs: list[Path], model: str,
                    size: str, quality: str, reasoning_effort: str) -> dict:
+    """POST /v1/responses + image_generation tool. 含 transient retry (502/503/504/429/500
+    或 network error). 单图成本 ¥0.1+, 不能因为一次瞬时网络抖动直接放弃."""
     base_url, api_key = _load_credentials()
     image_inputs = [_build_image_input(p) for p in refs]
     body = {
@@ -89,16 +95,34 @@ def call_responses(prompt_cn: str, refs: list[Path], model: str,
         "tool_choice": {"type": "image_generation"},
         "reasoning": {"effort": reasoning_effort},
     }
-    r = requests.post(
-        f"{base_url}/responses",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json=body, timeout=600,
-    )
-    return {
-        "http_status": r.status_code,
-        "raw": r.text if r.status_code != 200 else None,
-        "json": r.json() if r.status_code == 200 else None,
-    }
+    url = f"{base_url}/responses"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    attempts = [0] + _RETRY_BACKOFF_SEC  # [first try, +5s, +15s] = 共 3 次尝试
+    last_exc = None
+    last_resp = None
+    for attempt_idx, sleep_before in enumerate(attempts):
+        if sleep_before > 0:
+            print(f"  ⟳ retry attempt {attempt_idx + 1}/{len(attempts)} after {sleep_before}s backoff...", flush=True)
+            time.sleep(sleep_before)
+        try:
+            r = requests.post(url, headers=headers, json=body, timeout=600)
+            if r.status_code == 200:
+                return {"http_status": 200, "raw": None, "json": r.json(), "retry_count": attempt_idx}
+            last_resp = r
+            if r.status_code not in _TRANSIENT_STATUSES:
+                # non-transient (400/401/403/404 等) → 直接返回不 retry
+                break
+            print(f"  ⚠ HTTP {r.status_code} (transient), 准备 retry...", flush=True)
+        except (requests.ConnectionError, requests.Timeout) as e:
+            last_exc = e
+            print(f"  ⚠ network error ({type(e).__name__}: {e}), 准备 retry...", flush=True)
+    # 全部失败
+    if last_resp is not None:
+        return {"http_status": last_resp.status_code, "raw": last_resp.text, "json": None,
+                "retry_count": len(attempts) - 1}
+    # network exception 用尽 retry
+    return {"http_status": None, "raw": f"network exception: {type(last_exc).__name__}: {last_exc}",
+            "json": None, "retry_count": len(attempts) - 1}
 
 
 def main():
@@ -111,8 +135,12 @@ def main():
     ap.add_argument("--quality", default="high", help="codex-aligned default")
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--reasoning-effort", default=DEFAULT_REASONING, choices=["low", "medium", "high"])
-    ap.add_argument("--no-invariants", action="store_true", help="(legacy, hybrid 无 invariants)")
+    ap.add_argument("--no-invariants", action="store_true",
+                    help="(legacy CLI flag for backward compat with batch_runner / main-branch image_gen.py; "
+                         "hybrid 无 QUALITY_INVARIANTS 注入机制, flag noop)")
     args = ap.parse_args()
+    if args.no_invariants:
+        print("  ⚠ --no-invariants 是 legacy flag (兼容 main 分支 image_gen.py), hybrid 无 invariants 注入机制, noop", flush=True)
 
     prompt_raw = Path(args.prompt_file).read_text(encoding="utf-8")
     refs = [Path(p.strip()) for p in args.refs.split(",") if p.strip()]
@@ -133,13 +161,16 @@ def main():
 
     # ============================================================
     # Size override: sanitize 提取的 size 优先 CLI default
+    # 只在 size 值真不等时才报 override (避免 CLI 给 2048x1152 + prompt 也提到 2048x1152 时无谓 warn)
     # ============================================================
-    effective_size = sanitize_info.get("size") or args.size
-    if sanitize_info.get("size") and sanitize_info["size"] != args.size:
-        print(f"  ⚠ size override: CLI {args.size} → prompt-extracted {effective_size} ({sanitize_info.get('size_source')})", flush=True)
+    extracted = sanitize_info.get("size")
+    effective_size = extracted or args.size
+    if extracted and extracted != args.size:
+        print(f"  ⚠ size override: CLI {args.size} → prompt-extracted {extracted} ({sanitize_info.get('size_source')})", flush=True)
 
     print(f"=== sanitize info: {sanitize_info} ===", flush=True)
-    print(f"=== cleaned prompt ({len(cleaned)} chars):\n{cleaned[:500]}{'...' if len(cleaned) > 500 else ''}\n===", flush=True)
+    # prompt 预览: hybrid 中文 structured prompt 常 1500+ chars, 截 500 看不到约束段, 改 1500
+    print(f"=== cleaned prompt ({len(cleaned)} chars):\n{cleaned[:1500]}{'...' if len(cleaned) > 1500 else ''}\n===", flush=True)
 
     t0 = time.time()
     print(f"=> POST /responses model={args.model} refs={len(refs)} size={effective_size} quality={args.quality} reasoning={args.reasoning_effort}", flush=True)
@@ -204,19 +235,16 @@ def main():
     result_b64 = image_call.get("result")
 
     if status != "completed":
-        meta["error"] = f"image_generation_call.status={status} (期望 'completed')"
-        meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(f"! image_call.status={status}, result={'有' if result_b64 else '空'}", file=sys.stderr)
         if not result_b64:
+            # hard fail: 既无完成 status 也无 result
+            meta["error"] = f"image_generation_call.status={status} (期望 'completed') + result 为空"
+            meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+            print(f"! image_call.status={status}, result=空", file=sys.stderr)
             return 1
-        # 即使 status 异常但有 result,降级保存(soft success)
-        print(f"  ⚠ soft success: status 异常但 result 非空,保存图片继续", flush=True)
-
-    if not result_b64:
-        meta["error"] = f"image_call.result 为空 (status={status})"
-        meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(f"! no image result in response", file=sys.stderr)
-        return 1
+        # soft success: status 异常但有 result. 写 warning (不写 error, 避免下游 batch_runner
+        # 既看到 meta.error 又看到 rc=0 + PNG 落盘的契约冲突)
+        meta["warning"] = f"image_generation_call.status={status} (期望 'completed') 但 result 非空, soft success 保存"
+        print(f"  ⚠ soft success: status={status} 但 result 非空, 保存图片继续 (meta.warning 记录)", flush=True)
 
     # 写 PNG
     out_path.write_bytes(base64.b64decode(result_b64))
@@ -258,13 +286,16 @@ def main():
                     meta["post_cropped"] = {"from": meta["actual_size"], "to": target_size}
                     print(f"  ✂ post-crop {aw}x{ah} → {target_size} (居中)", flush=True)
                 else:
-                    print(f"  ⚠ target {target_size} 跟 actual {aw}x{ah} 不兼容, skip", flush=True)
+                    msg = f"target {target_size} 跟 actual {aw}x{ah} 不兼容 (target > actual on some axis, ratio_diff={ratio_diff:.3f})"
+                    print(f"  ⚠ {msg}, skip", flush=True)
+                    meta["post_resize_skipped"] = msg
                     target_size = None  # 留 actual_size 不变
                 if target_size:
                     meta["actual_size"] = target_size
                     meta["size_bytes"] = out_path.stat().st_size
         except Exception as e:
             print(f"  ⚠ post-resize 失败 (忽略,保留原图): {type(e).__name__}: {e}", flush=True)
+            meta["post_resize_error"] = f"{type(e).__name__}: {e}"
 
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"OK -> {out_path} ({meta['size_bytes']//1024} KB, actual={meta.get('actual_size','?')})", flush=True)
