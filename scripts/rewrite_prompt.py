@@ -118,7 +118,7 @@ REWRITE_SYSTEM = f"""你是 `game-ad-imagegen` skill 内部的 prompt 重写 age
 场景/背景: <氛围 + 关键 props + 来源>
 主角主体: <具体描述 + pose + 跟 ref 的关系>
 画风/介质: <从 vision 提取的风格描述 (笔触/材质/光影/线条/调色板/质感), 不写任何 franchise/IP/题材名>
-构图/比例/尺寸: <横/竖版 + 宽高比 + 尺寸 + 留白>
+构图/比例/尺寸: <宽高比 + 尺寸 + 关键构图元素位置>
 文字 (verbatim, 字位数模仿 ref 字位密度, 上限 5; ref 无文字则本段省略):
   - <位置 1>: "<引号内 exact verbatim>"
   - <位置 2>: "<...>"
@@ -128,20 +128,20 @@ REWRITE_SYSTEM = f"""你是 `game-ad-imagegen` skill 内部的 prompt 重写 age
 ```
 
 ==== 关键规则 (严格 enforce) ====
-1. **单主角单 panel**: 1 主角 + ≤2 supporting elements。绝不写 multi-panel / split-screen / 拼图。
-2. **文字位数量 = 模仿 ref 字位密度**: image model 在 ≥6 文字位时文字渲染塌,所以**上限 5 个文字位**。下限 = ref 实际字位数 (ref 几位就几位, 0 位也允许,意思整图不渲染任何文字)。两条规则:
-   - **不要无中生有加字位**: ref 是无文字 splash / concept art / 纯视觉 KV → 输出也不加文字, 哪怕 user prompt 提到"宣传语",也只放到 user 显式指定的一个字位 (没就空)
-   - **字位密度高的 ref 也别超 5**: ref 上有 8-10 字位的密集广告 → 输出截到 ≤5 个最关键字位 (优先 user 显式指定的 > ref 主标题 > ref 次标题, 其他略)
+1. **构图复刻 ref 实际形态**: 主体数量 + 版式按 ref vision 看到的实际形态 — ref 是单主体就单主体, 群像就群像, 分镜/拼图/split-screen 就照 ref 实际形态。**不预设任何主体数量上限**, 也不预设单 panel/多 panel 偏好。
+2. **文字位数量 = 模仿 ref 字位密度**: image model 在 ≥6 文字位时文字渲染塌, 所以**上限 5 个文字位**。下限 = ref 实际字位数 (ref 几位就几位, 0 位也允许, 意思整图不渲染任何文字)。两条规则:
+   - **不要无中生有加字位**: ref 是无文字 splash / concept art / 纯视觉 KV → 输出也不加文字, 哪怕 user prompt 提到 quoted 字面, 也只放到 user 显式指定的一个字位 (没就空)
+   - **字位密度高的 ref 也别超 5**: ref 上有 8-10 字位密集 → 输出截到 ≤5 个最关键字位 (优先 user 显式指定的 > ref 上最显著的字位 > ref 上较次的字位, 其他略)
   每个保留字位填什么:
-   - (a) user 显式指定的字 (`宣传语="..."` / 标题 / 副标语) → verbatim
-   - (b) ref 上有字位但 user 没指定内容 → 按 ref 字位的**语义功能**填对应内容 (ref 上原是 X 类信息 → 当前主角 X 类信息; ref 上原是品类/通用 slogan → 保留语义微调). 具体语义类型由 vision 实际识别决定, 不预设
-3. **删 user prompt 的批量控制语言**: "分别" / "5 张" / "做 N 张" / "分两排" 这些不是视觉指令,是告诉你产几段。**不要 echo 进任何 prompt**。
-4. **Verbatim**: 每个文字位的内容写引号内 exact verbatim (中文/英文/数字皆可)。永远不要含糊地说"主题文字"/"slogan 类的文案" — 会被 image model hallucinate。如果某位置 ref 上没字, 该位置直接**不写进 [文字] 段**即可 (不需要写"留空")。
-5. **Series variety when N>1 (非 anchor phase3)**: 每段不同 primary character (来自 CandidatePool),不要 N 段全是同一个角色的细微变体。
-6. **Style words from your vision**: 用 vision 看到的实际风格描述 (笔触/材质/光影/线条/调色板/质感)。**永远不要用 franchise / IP / 题材标签先验** (任何具体作品名/题材名都不允许); 只描述 vision 实际可见的视觉特征。
+   - (a) user 显式指定的 quoted 字面 → verbatim
+   - (b) ref 上有字位但 user 没指定内容 → 按 ref 字位的**语义功能**填对应内容 (ref 上原是 X 类信息 → 当前主体对应 X 类信息). 具体语义类型由 vision 实际识别决定, 不预设
+3. **删 user prompt 的批量控制语言**: "分别" / "5 张" / "做 N 张" / "分两排" 这些不是视觉指令, 是告诉你产几段。**不要 echo 进任何 prompt**。
+4. **Verbatim**: 每个文字位的内容写引号内 exact verbatim (中文/英文/数字皆可)。永远不要含糊地说"主题文字"或别的占位短语 — 会被 image model hallucinate。如果某位置 ref 上没字, 该位置直接**不写进 [文字] 段**即可 (不需要写"留空")。
+5. **Series variety when N>1 (非 anchor phase3)**: 每段不同 primary subject (来自 CandidatePool), 不要 N 段全是同一个主体的细微变体。
+6. **Style words from your vision**: 用 vision 看到的实际视觉特征描述 (笔触/材质/光影/线条/调色板/质感)。**永远不要用 franchise / IP / 题材标签先验** (任何具体作品名/题材名都不允许)。
 7. **Image role 显式 label**: 每张 ref 在 prompt 里必须显式 label 它的 role (avoid model 自由猜测 role 导致漂移)。
-8. **Edit mode 显式 invariants**: 若 use case 是 edit (用户说"改 X 其余不变" / "把 X 改成 Y"),约束必须含 "change only X; keep everything else (layout/typography/colors/composition/background) unchanged" 这种 invariant。
-9. **从 ref 复制视觉风格 + 装饰图形语言, 但不复制 ref 文字 verbatim**: image model 看 ref 时会把 ref 上的文字直接 copy 进新图。约束必须含 "do NOT copy any **text content** from reference images; only use text from the [文字 verbatim] section below"。**关键**: "避免"段**只禁文字 verbatim 内容**, **绝不能扩成"不要复制 ref 上的任何视觉装饰/图形元素"** — 过广避免会让 model 同时 strip ref 的图形语言, 导致出图比 ref 简陋。正确写法: "不要复制 ref 上的 verbatim 文字内容; 保留 ref 的装饰图形语言 (按 [Vision Notes] 里列出的装饰元素清单复刻形态)"。
+8. **Edit mode 显式 invariants**: 若 use case 是 edit (用户说"改 X 其余不变" / "把 X 改成 Y"), 约束必须含 "change only X; keep everything else (layout/typography/colors/composition/background) unchanged" 这种 invariant。
+9. **复刻 ref 视觉特征 + 不复制 ref 文字 verbatim**: image model 看 ref 时会把 ref 上的文字直接 copy 进新图。约束必须含 "do NOT copy any **text content** from reference images; only use text from the [文字 verbatim] section below"。**关键**: "避免"段**只禁文字 verbatim 内容**, **绝不能扩成"不要复制 ref 上的任何视觉特征"** — 过广避免会让 model 同时 strip ref 的视觉元素, 导致出图比 ref 简陋。正确写法: "不要复制 ref 上的 verbatim 文字内容; 复刻 ref 的视觉特征 (按 [Vision Notes] 里列出的视觉元素清单)"。
 
 ==== Anchor 模式特殊处理 ====
 - anchor_phase="phase1" (出 M 候选给 user 挑):
@@ -151,19 +151,19 @@ REWRITE_SYSTEM = f"""你是 `game-ad-imagegen` skill 内部的 prompt 重写 age
   - 字位按 Rule 2 (模仿 ref 字位密度, ref N 位就 N 位, 0 也允许, 上限 5)。不要为了"留 phase3 余地"刻意空着 — phase3 会重新跑 rewrite, 这里空着只让 phase1 候选图字位空白让 user 没法挑
 - anchor_phase="phase3" (用 picked anchor 锁风格生 N-1 张系列):
   - refs 列表里 Image {{anchor_idx}} 是用户挑的 picked anchor (来自 Phase 1 候选)
-  - 风格 LOCK 到 Image {{anchor_idx}}: 渲染技法/调色/排版/ref 的装饰图形语言 (按 [Vision Notes] 列出的装饰元素清单) 全部严格匹配
-  - **角色 LOCK** (反转旧版 bug): 跟 picked anchor 同一个角色,不要换。只 vary pose/scene/sidekick/小道具。
-  - 每段 prompt 必须显式写: "严格匹配 Image {{anchor_idx}} 的渲染风格、调色、UI 字体、装饰; 本张主角与 Image {{anchor_idx}} 保持同一角色身份,只换 pose 和场景细节"
+  - 风格 LOCK 到 Image {{anchor_idx}}: 渲染技法/调色/排版/ref 的视觉特征 (按 [Vision Notes] 列出的视觉元素清单) 全部严格匹配
+  - **主体 LOCK** (反转旧版 bug): 跟 picked anchor 同一主体身份, 不要换. 只 vary pose/场景/小道具。
+  - 每段 prompt 必须显式写: "严格匹配 Image {{anchor_idx}} 的渲染风格/调色/排版/视觉特征; 本张主体与 Image {{anchor_idx}} 保持同一身份, 只换 pose 和场景细节"
 
 ==== 输出格式 ====
 - N == 1: 直接输出 1 段中文 structured prompt (纯文本,无 markdown fence)
 - N >= 2: N 段中文 prompt,用单独一行 `{PROMPT_SEP}` 分隔。例:
   ```
-  用途: game-ad
+  用途: <自由文本, 不预设>
   主要请求: ...
   ... (第 1 段完整 labeled lines)
   {PROMPT_SEP}
-  用途: game-ad
+  用途: <自由文本, 不预设>
   主要请求: ...
   ... (第 2 段)
   {PROMPT_SEP}
@@ -253,14 +253,14 @@ def rewrite(user_prompt: str, reference_images, n: int = 1,
             raise ValueError(f"anchor_idx={anchor_idx} 超出 refs 范围 1..{len(ref_paths)}")
         user_text += (
             f"\n\n[ANCHOR LOCK MODE — Phase 3] Image {anchor_idx} 是用户在 Phase 1 候选轮挑的 "
-            f"**picked anchor 图**,它代表本批次的 LOCKED 视觉风格 — 渲染技法/调色/排版/ref 上的装饰图形语言 "
-            f"(按 [Vision Notes] 列出的装饰元素清单)。"
+            f"**picked anchor 图**,它代表本批次的 LOCKED 视觉风格 — 渲染技法/调色/排版/ref 上的视觉特征 "
+            f"(按 [Vision Notes] 列出的视觉元素清单)。"
             f"你的 {n} 段 prompt 必须视觉风格严格匹配 Image {anchor_idx} (**~85% faithful 而不是普通 70%**)。"
             f"**主角身份 LOCK** (反转旧版 bug — 不允许主角 vary): {n} 段 prompt 的主角都跟 Image {anchor_idx} "
             f"保持同一身份,只 vary pose/场景/小道具。其他 ref (Image ≠ {anchor_idx}) "
             f"提供额外 material 但不改变主角身份。"
             f"每段 prompt 的 [约束] 部分必须显式写: "
-            f"`严格匹配 Image {anchor_idx} 的渲染风格/调色/排版/装饰图形语言; 本张主角与 Image {anchor_idx} 保持同一身份`。"
+            f"`严格匹配 Image {anchor_idx} 的渲染风格/调色/排版/视觉特征; 本张主体与 Image {anchor_idx} 保持同一身份`。"
             f"最终批次 (picked anchor + {n} 张新图) 应该看起来像 coherent set,而不是 {n+1} 张不相关的图。"
         )
 
@@ -309,17 +309,14 @@ def rewrite(user_prompt: str, reference_images, n: int = 1,
                 if "reasoning" in emsg and any(s in emsg for s in ("unknown", "unsupported", "invalid", "400")):
                     is_reasoning_unsupported = True
             if is_reasoning_unsupported and use_reasoning:
-                print(f"  [rewrite-cn] WARN: model={model} 不支持 reasoning_effort, fallback to no-reasoning", file=sys.stderr, flush=True)
+                # 切到 no-reasoning + 让外层 loop 走下一轮 (用 backoff). 不再立即同步重试 —
+                # 避免烧 retry slot + 让 transient 检查只看 last_exc 这一个状态.
+                print(f"  [rewrite-cn] WARN: model={model} 不支持 reasoning_effort, fallback to no-reasoning (重试将在下一轮 backoff)", file=sys.stderr, flush=True)
                 use_reasoning = False
-                # 立即不带 backoff 重试一次 (这次切到 no-reasoning)
-                try:
-                    response = client.chat.completions.create(model=model, messages=msgs)
-                    break
-                except Exception as e2:
-                    last_exc = e2  # 落到下一轮 transient retry
+                continue  # 下一轮 attempt (会用 use_reasoning=False, 不带 backoff 因为 attempt_idx 没变 — 实际下次会带, 让 _RETRY_BACKOFF_SEC 决定)
             # 判断是否是 transient: HTTP status code in _TRANSIENT_STATUSES
-            status = getattr(last_exc, "status_code", None) or getattr(getattr(last_exc, "response", None), "status_code", None)
-            if status in _TRANSIENT_STATUSES:
+            status_code = getattr(last_exc, "status_code", None) or getattr(getattr(last_exc, "response", None), "status_code", None)
+            if status_code in _TRANSIENT_STATUSES:
                 continue  # 下一轮 backoff
             # 非 transient 直接抛
             raise
