@@ -114,6 +114,12 @@ def call_responses(prompt_cn: str, refs: list[Path], model: str,
         except (requests.ConnectionError, requests.Timeout) as e:
             last_exc = e
             print(f"  ⚠ network error ({type(e).__name__}: {e}), 准备 retry...", flush=True)
+        except requests.exceptions.RequestException as e:
+            # 其他 RequestException (TooManyRedirects/InvalidURL/SSLError 等) — 不 retry,
+            # 直接返回让 main() 写 meta + exit 1 (这些是配置错误, retry 没用)
+            return {"http_status": None,
+                    "raw": f"non-retryable request error: {type(e).__name__}: {e}",
+                    "json": None, "retry_count": attempt_idx}
     # 全部失败
     if last_resp is not None:
         return {"http_status": last_resp.status_code, "raw": last_resp.text, "json": None,
@@ -145,10 +151,21 @@ def main():
 
     prompt_raw = Path(args.prompt_file).read_text(encoding="utf-8")
     refs = [Path(p.strip()) for p in args.refs.split(",") if p.strip()]
+    # Exit code 区分 (round-5 blind #2): ref 路径错 = exit 3, 不跟 CredentialsError (exit 2)
+    # 冲突 — 否则 SKILL.md setup wizard 看 exit 2 误以为缺 key
     for r in refs:
         if not r.exists():
             print(f"! ref not found: {r}", file=sys.stderr)
-            return 2
+            return 3
+    # Ref 预检 (round-5 blind #17): 防 50MB 大图 → 600s timeout × 3 retry = 30min 浪费 credit
+    _REF_MAX_BYTES = 20 * 1024 * 1024  # ephone 端实测上限 ~20MB
+    for r in refs:
+        size_b = r.stat().st_size
+        if size_b > _REF_MAX_BYTES:
+            print(f"! ref too large: {r.name} = {size_b // (1024*1024)} MB > 20 MB. "
+                  f"请用 PIL/ffmpeg/手动压缩到 <20MB 再传 (避免 ephone 600s timeout × N retry 烧 credit)",
+                  file=sys.stderr)
+            return 3
 
     # ============================================================
     # Sanitize: 二选一入口
@@ -168,11 +185,15 @@ def main():
     # ============================================================
     extracted = sanitize_info.get("size")
     DEFAULT_SIZE = "2048x1152"
+    size_override_note = None  # 写进 meta 给 audit trail (round-5 blind #8)
     if args.size:  # 显式传 (batch 配)
         effective_size = args.size
         if extracted and extracted != args.size:
-            print(f"  ⚠ explicit --size {args.size}, prompt 内提到的 size {extracted} 被忽略 "
-                  f"({sanitize_info.get('size_source')})", flush=True)
+            size_override_note = (
+                f"explicit --size {args.size} 优先, prompt 内 size {extracted} 被忽略 "
+                f"(原因: {sanitize_info.get('size_source')})"
+            )
+            print(f"  ⚠ {size_override_note}", flush=True)
             # 既然忽略 sanitize 的 size, target_size 也清掉防止 post-resize 跑错
             sanitize_info["target_size"] = None
             sanitize_info["upscaled"] = False
@@ -211,6 +232,7 @@ def main():
         "n_refs": len(refs),
         "prompt_chars": len(cleaned),
         "sanitize_info": sanitize_info,
+        "size_override_note": size_override_note,  # 非 None 时记录 prompt-size 被 --size override 的事实
     }
 
     if res["http_status"] != 200:
