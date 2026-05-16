@@ -48,9 +48,21 @@ def _encode_image(p: Path) -> str:
     return base64.b64encode(p.read_bytes()).decode()
 
 
+_REF_MIME_MAP = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
+
+
 def _build_image_input(p: Path) -> dict:
     ext = p.suffix.lower()
-    mime = "image/jpeg" if ext in (".jpg", ".jpeg") else "image/png"
+    mime = _REF_MIME_MAP.get(ext)
+    if mime is None:
+        raise ValueError(
+            f"unsupported ref ext {ext!r} for {p.name}; ephone image_generation tool 接受 "
+            f".jpg/.jpeg/.png/.webp. 其他格式 (gif/bmp/tiff/heic) 请先转换 PNG/JPG."
+        )
     return {"type": "input_image", "image_url": f"data:{mime};base64,{_encode_image(p)}"}
 
 
@@ -117,7 +129,10 @@ def main():
     ap.add_argument("--refs", default="", help="逗号分隔的参考图路径,可空")
     ap.add_argument("--out", required=True)
     ap.add_argument("--meta-out", required=True)
-    ap.add_argument("--size", default="2048x1152", help="default 16:9 (ephone tool 要求 ÷16)")
+    ap.add_argument("--size", default=None,
+                    help="explicit size 'WxH'. 不传则用默认 2048x1152, 或被 sanitize 提取的 prompt size 覆盖. "
+                         "传了 --size 则视为 batch 显式意图, prompt 内 size 不再 override (避免 batch config "
+                         "size 被 prompt verbatim 文本意外 override)")
     ap.add_argument("--quality", default="high", help="codex-aligned default")
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--reasoning-effort", default=DEFAULT_REASONING, choices=["low", "medium", "high"])
@@ -146,13 +161,26 @@ def main():
         print(f"=== sanitize (raw user prompt, no SENTINEL): light cleanup applied ===", flush=True)
 
     # ============================================================
-    # Size override: sanitize 提取的 size 优先 CLI default
-    # 只在 size 值真不等时才报 override (避免 CLI 给 2048x1152 + prompt 也提到 2048x1152 时无谓 warn)
+    # Size 解析优先级:
+    #   1. --size 显式传 (batch_runner 配的)  → 用它, prompt 内 size 只 log warn 不 override
+    #   2. sanitize 提取的 size (user prompt 里写"1920x1080")  → 用它
+    #   3. 默认 2048x1152
     # ============================================================
     extracted = sanitize_info.get("size")
-    effective_size = extracted or args.size
-    if extracted and extracted != args.size:
-        print(f"  ⚠ size override: CLI {args.size} → prompt-extracted {extracted} ({sanitize_info.get('size_source')})", flush=True)
+    DEFAULT_SIZE = "2048x1152"
+    if args.size:  # 显式传 (batch 配)
+        effective_size = args.size
+        if extracted and extracted != args.size:
+            print(f"  ⚠ explicit --size {args.size}, prompt 内提到的 size {extracted} 被忽略 "
+                  f"({sanitize_info.get('size_source')})", flush=True)
+            # 既然忽略 sanitize 的 size, target_size 也清掉防止 post-resize 跑错
+            sanitize_info["target_size"] = None
+            sanitize_info["upscaled"] = False
+    elif extracted:
+        effective_size = extracted
+        print(f"  ↪ size from prompt: {extracted} ({sanitize_info.get('size_source')})", flush=True)
+    else:
+        effective_size = DEFAULT_SIZE
 
     print(f"=== sanitize info: {sanitize_info} ===", flush=True)
     # prompt 预览: hybrid 中文 structured prompt 常 1500+ chars, 截 500 看不到约束段, 改 1500
@@ -224,15 +252,16 @@ def main():
     status = image_call.get("status")
     result_b64 = image_call.get("result")
 
+    # result=None hard fail — 防 base64.b64decode(None) TypeError (含 status="completed"
+    # 但 result 缺失的 safety-policy partial response case, round-4 blind #1 抓)
+    if not result_b64:
+        meta["error"] = f"image_call.result 为空 (status={status})"
+        meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"! image_call.result=空 (status={status})", file=sys.stderr)
+        return 1
+
     if status != "completed":
-        if not result_b64:
-            # hard fail: 既无完成 status 也无 result
-            meta["error"] = f"image_generation_call.status={status} (期望 'completed') + result 为空"
-            meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
-            print(f"! image_call.status={status}, result=空", file=sys.stderr)
-            return 1
-        # soft success: status 异常但有 result. 写 warning (不写 error, 避免下游 batch_runner
-        # 既看到 meta.error 又看到 rc=0 + PNG 落盘的契约冲突)
+        # soft success: status 异常但有 result. 写 warning (不写 error 避免契约冲突)
         meta["warning"] = f"image_generation_call.status={status} (期望 'completed') 但 result 非空, soft success 保存"
         print(f"  ⚠ soft success: status={status} 但 result 非空, 保存图片继续 (meta.warning 记录)", flush=True)
 
@@ -247,45 +276,38 @@ def main():
         if meta["actual_size"] != effective_size:
             print(f"  ⚠ actual_size {meta['actual_size']} ≠ requested {effective_size}", flush=True)
 
-    # Post-resize: 让 user 拿到他要的尺寸 (ephone ÷16 round 或 upscale 出来的尺寸跟 user 要的不一致)
-    # 两种 case:
-    #   (a) Round case (1920x1080 → ephone 1920x1088): actual ≥ target → PIL center crop
-    #   (b) Upscale case (650x250 → ephone 2624x1024): actual > target on both axes → PIL LANCZOS resize
+    # Post-resize: 让 user 拿到他要的尺寸. 用 sanitize_info["upscaled"] flag 决定分支
+    # (不再 re-derive from dimensions — 防边缘 case 如 1700x950 错走 crop 丢内容,
+    # round-4 blind #4 抓):
+    #   (a) upscaled=True: user 要 sub-655K size → ephone 放大到 ≥1024 短边 → PIL LANCZOS resize 回 target
+    #   (b) upscaled=False + target≠actual: round case (÷16 round 微调) → PIL center crop 回 target
     target_size = sanitize_info.get("target_size")
-    if target_size and meta.get("actual_size") and target_size != meta["actual_size"]:
+    use_lanczos = bool(sanitize_info.get("upscaled"))
+    actual_size_str = meta.get("actual_size")
+    if target_size and actual_size_str and target_size != actual_size_str:
         try:
             from PIL import Image
             tw, th = (int(x) for x in target_size.split("x"))
+            aw, ah = (int(x) for x in actual_size_str.split("x"))
             with Image.open(out_path) as im:
-                aw, ah = im.size
-                # 判断 case: aspect ratio 跟 target 接近 (差 < 5%) → upscale case 用 resize
-                # 否则 → round case 用 center crop
-                target_ratio = tw / th
-                actual_ratio = aw / ah
-                ratio_diff = abs(target_ratio - actual_ratio) / target_ratio
-                # 比例差 <5% (容差 ÷16 round 引入的微小比例偏移) + 某轴超 target 1.5x
-                # → 判定为 upscale case (sub-655K user request 被 ephone 放大到 ≥1024 短边),
-                # 走 LANCZOS downsize 回 user 期望. 比例差 >5% 或者尺寸跟 target 接近
-                # → 走 round case, center crop (跟 ÷16 round 引入的小幅尺寸差兼容)
-                if ratio_diff < 0.05 and (aw > tw * 1.5 or ah > th * 1.5):
+                if use_lanczos:
                     im.resize((tw, th), Image.LANCZOS).save(out_path)
-                    meta["post_resized"] = {"from": meta["actual_size"], "to": target_size, "method": "LANCZOS"}
-                    print(f"  ↘ post-resize {aw}x{ah} → {target_size} (LANCZOS, 保 user 期望 size)", flush=True)
+                    meta["post_resized"] = {"from": actual_size_str, "to": target_size, "method": "LANCZOS"}
+                    print(f"  ↘ post-resize {aw}x{ah} → {target_size} (LANCZOS, sanitize upscaled=True)", flush=True)
                 elif aw >= tw and ah >= th:
-                    # round case: center crop
                     left = (aw - tw) // 2
                     top = (ah - th) // 2
                     im.crop((left, top, left + tw, top + th)).save(out_path)
-                    meta["post_cropped"] = {"from": meta["actual_size"], "to": target_size}
-                    print(f"  ✂ post-crop {aw}x{ah} → {target_size} (居中)", flush=True)
+                    meta["post_cropped"] = {"from": actual_size_str, "to": target_size}
+                    print(f"  ✂ post-crop {aw}x{ah} → {target_size} (居中, round case)", flush=True)
                 else:
-                    msg = f"target {target_size} 跟 actual {aw}x{ah} 不兼容 (target > actual on some axis, ratio_diff={ratio_diff:.3f})"
+                    msg = f"target {target_size} 跟 actual {aw}x{ah} 不兼容 (target > actual on some axis); sanitize upscaled=False"
                     print(f"  ⚠ {msg}, skip", flush=True)
                     meta["post_resize_skipped"] = msg
-                    target_size = None  # 留 actual_size 不变
-                if target_size:
-                    meta["actual_size"] = target_size
-                    meta["size_bytes"] = out_path.stat().st_size
+                    target_size = None
+            if target_size:
+                meta["actual_size"] = target_size
+                meta["size_bytes"] = out_path.stat().st_size
         except Exception as e:
             print(f"  ⚠ post-resize 失败 (忽略,保留原图): {type(e).__name__}: {e}", flush=True)
             meta["post_resize_error"] = f"{type(e).__name__}: {e}"
