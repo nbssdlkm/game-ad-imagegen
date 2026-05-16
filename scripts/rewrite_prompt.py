@@ -262,14 +262,15 @@ def rewrite(user_prompt: str, reference_images, n: int = 1,
             raise ValueError(f"anchor_idx={anchor_idx} 超出 refs 范围 1..{len(ref_paths)}")
         user_text += (
             f"\n\n[ANCHOR LOCK MODE — Phase 3] Image {anchor_idx} 是用户在 Phase 1 候选轮挑的 "
-            f"**picked anchor 图**,它代表本 series 整体的 LOCKED 视觉风格 — 渲染技法/调色/UI 字体/装饰/卡框样式。"
+            f"**picked anchor 图**,它代表本批次的 LOCKED 视觉风格 — 渲染技法/调色/排版/ref 上的装饰图形语言 "
+            f"(按 [Vision Notes] 列出的装饰元素清单)。"
             f"你的 {n} 段 prompt 必须视觉风格严格匹配 Image {anchor_idx} (**~85% faithful 而不是普通 70%**)。"
-            f"**角色身份 LOCK** (反转旧版 bug — 不允许角色 vary): {n} 段 prompt 的主角都跟 Image {anchor_idx} "
-            f"同一个角色,只 vary pose/scene/sidekick/小道具。其他 ref (Image ≠ {anchor_idx}) "
-            f"提供额外 character/scene material 但不要改变主角身份。"
+            f"**主角身份 LOCK** (反转旧版 bug — 不允许主角 vary): {n} 段 prompt 的主角都跟 Image {anchor_idx} "
+            f"保持同一身份,只 vary pose/场景/小道具。其他 ref (Image ≠ {anchor_idx}) "
+            f"提供额外 material 但不改变主角身份。"
             f"每段 prompt 的 [约束] 部分必须显式写: "
-            f"`严格匹配 Image {anchor_idx} 的渲染风格/调色/UI 字体/装饰; 本张主角与 Image {anchor_idx} 保持同一角色身份`。"
-            f"最终系列 (picked anchor + {n} 张新图) 应该看起来像 coherent set,而不是 {n+1} 张不相关的图。"
+            f"`严格匹配 Image {anchor_idx} 的渲染风格/调色/排版/装饰图形语言; 本张主角与 Image {anchor_idx} 保持同一身份`。"
+            f"最终批次 (picked anchor + {n} 张新图) 应该看起来像 coherent set,而不是 {n+1} 张不相关的图。"
         )
 
     user_content = image_contents + [{"type": "text", "text": user_text}]
