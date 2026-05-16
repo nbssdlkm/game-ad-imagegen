@@ -2,8 +2,7 @@
 name: game-ad-imagegen
 description: |
   生成**游戏买量广告图 / 海报 / 买量素材**(特化场景)。当用户提供「爆款参考图 + 实机图 + 中文 prompt」请你做 N 张游戏广告系列图时使用。
-  模拟网页版 ChatGPT 的"对话模型 → image_gen.text2im"工作流,按 6 步流程产出 N 张高质量横版广告图(默认 1536x1024 = gpt-image-2 合法 landscape)。
-  题材无关 / 角色无关:所有视觉特征由 vision call 从用户提供的参考图与实机图自动识别,skill 本体不预设任何题材或角色。**支持 0 图(纯文字生买量素材,text2im)和 ≥1 图(edit / 多图融合)**;0 图走 `/v1/images/generations`,有图走 `/v1/images/edits`。非游戏广告题材(通用任意题材)请走 codex-imagegen-fork。
+  Hybrid path (2026-05-16): 调用 `/v1/responses` + `image_generation` tool (跟 ChatGPT 网页版同源, 一体化 vision + 生图), model `gpt-5.4 + reasoning_effort=medium`, 默认 size `2048x1152` (16:9, ÷16 合规). 由 `rewrite_prompt.py` 输出**中文 structured prompt** (codex labeled-lines 模板 + 强制 `[Vision Notes]` 块反 hallucination), 经 `prompt_sanitize.py` 兜底层 (SENTINEL 验 / size auto-fit / 否定→正向) 送 `image_gen_hybrid.py`. 任意 user 期望 size 都能 honor (1920x1080 → ephone ÷16 round 1920x1088 → PIL center crop 回 1080 / 650x250 banner < 655K 像素 → ephone upscale 到 2624x1024 → LANCZOS resize 回 user 期望). 题材无关 / 角色无关。非游戏广告题材请走 codex-imagegen-fork。
   **跟 `codex-imagegen-fork` (B skill) 的差异化**:A 专做游戏买量广告(爆款复刻 + 多张系列 + 6 步 vision 工作流);B 做通用图片任务(单图修改 / 0 图文生图 / 任意题材)。设计师如果是"复刻爆款 + 出 N 张系列广告图"走 A;如果是"通用修图 / PS 一下 / 纯文字生一张"走 B。
   触发词:复刻这张爆款图给我们游戏 / 做几张游戏广告图 / 学这张图做几张类似的 / 游戏海报生成 / 买量素材 / 任意题材的游戏广告图复刻 / 出 N 张系列广告图。
 ---
@@ -14,9 +13,8 @@ description: |
 
 **进入 image API 的每一个 prompt 必须由 `scripts/rewrite_prompt.py` 产出，无任何 bypass**。没有这条，出图质量退回 case_22 的中文 prompt 幻觉模式，skill 失去意义。
 
-`scripts/image_gen.py` 在入口处双闸校验：
-1. **SENTINEL marker 校验** — prompt 第一行必须是 `# REWRITTEN-V1`（由 `rewrite_prompt.py` 自动加在每段产出的开头）。缺标记 → `RuntimeError`，prompt 不发 API。
-2. **CJK 字符占比兜底** — 通过 SENTINEL 后再查 CJK 占比，>10% 即拒（防 rewrite LLM 偶发返回中文）。
+`scripts/image_gen_hybrid.py` 入口校验:
+- **SENTINEL marker 校验** — prompt 第一行必须是 `# REWRITTEN-CN-V2`（由 `rewrite_prompt.py` 自动加在每段产出的开头）。缺标记 → 走 `sanitize_raw_user_prompt` 兜底入口 + warning. (hybrid 路径**没有** CJK 字符占比闸 — rewriter 输出本身就是中文, 不能用 CJK 占比拒)
 
 **已删的全部 bypass 路径**：
 - `--no-rewrite` CLI flag
@@ -24,15 +22,15 @@ description: |
 - rewrite 失败时静默 fallback 原中文 → 现在失败整批 fail-fast
 
 **对 agent 的硬约束**：
-- **Mode 1**：Step 4 必须**调 `python scripts/rewrite_prompt.py`** 让脚本做 vision + rewrite + 包 SENTINEL。**不要自己手写英文 prompt 然后调 `image_gen.py`** —— agent 手写的 prompt 没 SENTINEL 会被入口拦截。Step 4 详述的原则是 `rewrite_prompt.py` 内部 system prompt 在用的，贴在文档里供 agent 排错时理解 rewrite 行为，不是让 agent 自己复制粘贴照写。
+- **Mode 1**：Step 4 必须**调 `python scripts/rewrite_prompt.py`** 让脚本做 vision + rewrite + 输出**中文 structured prompt with [Vision Notes] 块** + 包 SENTINEL。**不要自己手写 prompt 然后调 `image_gen_hybrid.py`** —— agent 手写的 prompt 没 SENTINEL 会被走 raw 入口降级。Step 4 详述的原则是 `rewrite_prompt.py` 内部 system prompt 在用的，贴在文档里供 agent 排错时理解 rewrite 行为，不是让 agent 自己复制粘贴照写。
 - **Mode 2**（batch UX）：`batch_runner.py` 自动调 `rewrite_prompt.py`，agent 不介入。
-- **Rewrite-only mode**（Step 4.5）：走 `rewrite_prompt.py` 拿到 SENTINEL-wrapped prompt 后把它输出到对话区让用户复制；不调 `image_gen.py`，跟 invariant 解耦。
+- **Rewrite-only mode**（Step 4.5）：走 `rewrite_prompt.py` 拿到 SENTINEL-wrapped 中文 structured prompt 后把它输出到对话区让用户复制；不调 `image_gen_hybrid.py`。
 
 ---
 
 ## 这个 skill 在干什么
 
-**复刻"网页 ChatGPT 出爆款游戏广告图"的工作流**——用户给爆款参考图 + 自家实机图 + 一段中文 prompt，agent 模拟网页 GPT-5.x 的 6 步操作（理解 → 拆解 → 选角色 → rewrite → 调 image_gen → 归档），输出 N 张高质量游戏广告图。
+**复刻"网页 ChatGPT 出爆款游戏广告图"的工作流**——用户给爆款参考图 + 自家实机图 + 一段中文 prompt，agent 走 hybrid path (rewrite → image_gen_hybrid: `/v1/responses` + image_generation tool)，输出 N 张高质量游戏广告图。Hybrid path 跟 ChatGPT 网页版同源, gpt-5.4 一体化处理 vision + 生图, sanitize 层做 SENTINEL 验证 + size auto-fit 让任意 user 期望 size 都能 honor。
 
 质量目标：
 - ✅ 出图质量复刻 ChatGPT 网页版水平（image_gen 一次性把所有中文 text 画在图里）
@@ -49,11 +47,11 @@ LLM agent 检测到下列条件命中时启动 skill：
 
 **支持的形态**（28 raw case 验证）：1 张图改文案 / 2 张爆款风格融合 / 3 张含 UI+文字+角色头像迁移 / 5+ 张实机图自由组合 — 都走 A skill；图的角色（参考 / 素材 / 叠加目标）由用户 prompt 描述 + vision 实际识别决定。
 
-**0 图模式**：用户给 0 张参考图 + 纯文字描述游戏买量素材（如"做一张三国主题游戏 banner，主标题立即下载"），A 走 `/v1/images/generations` 端点（text2im），仍走 rewrite_prompt + invariant 双闸。Anchor mode 不支持 0 图（vision verify 需要图）。**非游戏广告题材**（产品照 / 企业 logo / 真实摄影 / infographic 等通用任意题材）→ B skill `codex-imagegen-fork`，那边的 system prompt 是 generic taxonomy 不会强加买量风格。
+**0 图模式**：用户给 0 张参考图 + 纯文字描述游戏买量素材（如"做一张三国主题游戏 banner，主标题立即下载"），hybrid 不切端点 — `/v1/responses` + `image_generation` tool 同样接受 0 图 (refs 为空数组), text2im 模式仍走 rewrite_prompt + SENTINEL 单闸。Anchor mode 不支持 0 图（vision verify 需要图）。**非游戏广告题材**（产品照 / 企业 logo / 真实摄影 / infographic 等通用任意题材）→ B skill `codex-imagegen-fork`，那边的 system prompt 是 generic taxonomy 不会强加买量风格。
 
 ## 必读约束（QUALITY INVARIANTS）
 
-`scripts/_config.py` 里的 `QUALITY_INVARIANTS` 会自动注入到每次 image_gen 调用，但 agent 在 Step 4 装配 prompt 时也要遵守。这些约束**与图片张数 / 形态无关**：
+agent 在 Step 4 装配 prompt 时遵守以下 quality 约束 (hybrid path 由 rewriter system prompt 教 LLM 直接 enforce, 没有 _config.py 注入机制). 这些约束**与图片张数 / 形态无关**：
 
 | 约束 | 含义 | 失败案例 |
 |---|---|---|
@@ -121,7 +119,7 @@ UserIntent:    { 输出张数: N,
                  主CTA: <用户原话>,
                  题材: <如用户原话明确指定，照贴；没指定则写"由 vision 推断"，照 PerImageNotes 实际看到的题材填>,
                  自由创作度: <默认 30%>,
-                 画幅: <默认 1536x1024 / 用户指定按指定> }
+                 画幅: <默认 2048x1152 / 用户指定按指定> }
 ```
 
 ⚠️ **题材字段只在用户原话明确指定**（如"我们的 X 游戏"）时填，否则永远写"由 vision 推断"。不要根据任何参考图的角色形象**猜测**题材然后套预设模板。
@@ -132,7 +130,7 @@ UserIntent:    { 输出张数: N,
 
 把用户 prompt 拆成可执行约束清单：
 - 输出数量 N（用户 prompt 里说几张就几张；没说默认 1）
-- 画幅 + 比例（**默认 `1536x1024`** ≈ 16:9，gpt-image-2 合法 landscape；用户要其他尺寸如 1920x1080 / 9:16 / 650x250 时映射到最接近的合法 size：1024x1024 / 1536x1024 / 1024x1536 / auto）
+- 画幅 + 比例（**默认 `2048x1152`** ≈ 16:9, ÷16 合规；用户要任意尺寸如 1920x1080 / 9:16 竖版 / 650x250 banner — **sanitize 会自动 fit**：1920x1080 → ephone 1920x1088 → PIL center crop 回 1080 / 9:16 keyword → 1152x2048 / 650x250 (<655K 像素) → ephone 2624x1024 → LANCZOS resize 回 650x250。user 拿到他要的 size, ephone ÷16/最小 655K 像素约束由 sanitize 自动处理）
 - 风格描述（来自 Step 1 StyleSummary，**全部由 vision 抓取**）
 - 版式（来自 Step 1 StyleSummary 视觉描述——参考图实际看到啥版式就跟啥版式：单角色海报就单角色 / 漫画分镜就分镜 / 面板就面板 / 风格融合就融合，**不套固定模板**）
 - 主文案（用户 prompt 里指定的 CTA 文字 + Step 1 PerImageNotes.chinese_text_in_image 抓到的原图中文）
@@ -155,7 +153,7 @@ UserIntent:    { 输出张数: N,
 
 ### Step 4: Prompt rewriting（调 `rewrite_prompt.py`，不自己手写）
 
-🚨 **Hard Invariant 要求**：agent 不自己手写英文 prompt 然后调 `image_gen.py`。改为：把用户中文需求 + 参考图路径 + 目标张数 N 传给 `scripts/rewrite_prompt.py`，让脚本做 vision + rewrite + SENTINEL 包装。
+🚨 **Hard Invariant 要求**：agent 不自己手写英文 prompt 然后调 `image_gen_hybrid.py`。改为：把用户中文需求 + 参考图路径 + 目标张数 N 传给 `scripts/rewrite_prompt.py`，让脚本做 vision + rewrite + SENTINEL 包装。
 
 ```bash
 python scripts/rewrite_prompt.py \
@@ -165,11 +163,11 @@ python scripts/rewrite_prompt.py \
   --out rewritten.txt
 ```
 
-输出文件 `rewritten.txt` 每段以 `# REWRITTEN-V1` 开头（多段用 `---PROMPT-SEP---` 分隔），Step 5 把每段拆出来传给 `image_gen.py --prompt-file`。
+输出文件 `rewritten.txt` 每段以 `# REWRITTEN-CN-V2` 开头（多段用 `---PROMPT-SEP---` 分隔），Step 5 把每段拆出来传给 `image_gen_hybrid.py --prompt-file`。
 
 **下方原则是 `rewrite_prompt.py` 内部 system prompt 教 LLM 的规则**，贴在这里供 agent 排错时理解 rewrite 行为 / 解释结果给用户 / 微调用户原始中文需求。**agent 不要自己手抄这些规则写英文 prompt 然后塞给 image_gen** —— 入口 SENTINEL 闸会拦下，且这样做绕开了 `rewrite_prompt.py` 的 vision verify 环节。
 
-**为什么 prompt 字面精度直接决定结果**：`image_gen.py` 切到 `/v1/images/edits` 端点后，**prompt 字面就是 image model 收到的，没有 L2 rewriter 二次改写**。verbatim 中文准确度靠 rewrite 字面精度，scene complexity 直接决定 image model text 渲染 budget。
+**为什么 prompt 字面精度直接决定结果**：`image_gen_hybrid.py` 用 `/v1/responses` + `image_generation` tool 端点 — **prompt 字面 + refs 一起送给 image model, model 内部 vision + 生图一体化处理**。verbatim 中文准确度靠 rewrite 字面精度，scene complexity 直接决定 image model text 渲染 budget。
 
 #### 必须遵守的原则(case_24 / case_09 / case_04 跨场景验证)
 
@@ -262,7 +260,7 @@ Quality and style requirements:
 
 **第 1 次调用**：
 ```bash
-python scripts/image_gen.py \
+python scripts/image_gen_hybrid.py \
   --prompt-file <step4 第 1 段 prompt 写到的临时文件> \
   --refs <用户的参考图,实机图1,实机图2,...> \
   --out <临时输出目录>/01.png \
@@ -270,14 +268,14 @@ python scripts/image_gen.py \
 ```
 
 第 1 张作风格基准。完成后检查:
-- HTTP 200 + meta_json 落盘 + PNG 文件大小 > 0(`/v1/images/edits` 端点不返回 `revised_prompt`)
+- HTTP 200 + meta_json 落盘 + PNG 文件大小 > 0; meta.json 里有 `image_call_status="completed"` + `revised_prompt` (image_gen tool 内部 revise 后的 prompt, 供 audit)
 - PNG 含 readable Chinese text(不是空白)
 
 **多图(N ≥ 2)调用** — 两条路径,**按需求选**(不是哪条都行,语义不同):
 
 | 路径 | 多张图之间的关系 | 何时选 | 怎么跑 |
 |---|---|---|---|
-| **简单循环**(默认) | **N 张是同一系列**——同一爆款风格、同一角色池、统一构图调子。每次调用都传**所有用户参考图**,让 image model 根据完整 ref 上下文 + N 段 prompt 自己保系列一致性。 | 用户要"5 张系列广告"、"爆款复刻 N 张"——希望视觉一致 | 循环 N 次 `python scripts/image_gen.py --prompt-file <step4_i.txt> --refs <所有用户参考图都传> --out <i>.png` |
+| **简单循环**(默认) | **N 张是同一系列**——同一爆款风格、同一角色池、统一构图调子。每次调用都传**所有用户参考图**,让 image model 根据完整 ref 上下文 + N 段 prompt 自己保系列一致性。 | 用户要"5 张系列广告"、"爆款复刻 N 张"——希望视觉一致 | 循环 N 次 `python scripts/image_gen_hybrid.py --prompt-file <step4_i.txt> --refs <所有用户参考图都传> --out <i>.png` |
 | **走 Batch UX** | **N 个独立 task**——每个 task 有自己的 prompt + refs + n,task 之间互不影响,同一 task 内 n>1 是该 prompt 的不同 sampling(多样性) | 用户要"跑 3 个不同主题各 2 张"、需要 self-serve 填表、或者要看 result_grid 实时进度 | 走下方 "Mode 2: Batch UX" 段(form 或粘 config.json) |
 
 ⚠️ **关键差异**:简单循环 = 同系列保 N 张一致;Batch UX = 独立 task 矩阵。**不要混用心智模型**——同一 task n>1 不是"系列"(没有共享 anchor 跨调用),想要系列一致请用简单循环。
@@ -321,7 +319,7 @@ python scripts/save_outputs.py \
 | `scripts/launch_detached.py` | **进程脱离 launcher**(必走) | `~/.claude/skills/game-ad-imagegen/scripts/launch_detached.py` |
 | `scripts/render_result_grid.py` | grid HTML 生成 | `~/.claude/skills/game-ad-imagegen/scripts/render_result_grid.py` |
 
-runner 内用 `Path(__file__).resolve().parent` anchor 自动定位本 skill 的 `image_gen.py`(sibling),**不跨 skill 查 B**。
+runner 内用 `Path(__file__).resolve().parent` anchor 自动定位本 skill 的 `image_gen_hybrid.py`(sibling),**不跨 skill 查 B**。
 
 ### 入口 — agent 自动开 form (设计师 self-serve 路径)
 
@@ -421,7 +419,7 @@ agent 发一条简短消息(根据用哪个 tier 微调措辞):
   "batch_id": "...",
   "skill": "a",               // 必须 "a"(本 skill runner 只接 'a')
   "out_dir": "...",
-  "size": "1536x1024",        // batch 默认尺寸 (1024x1024 / 1536x1024 / 1024x1536 / auto)
+  "size": "2048x1152",        // batch 默认尺寸 (1024x1024 / 2048x1152 / 1024x1536 / auto)
   "quality": "medium",        // batch 默认质量 (low / medium / high)
   "tasks": [
     {
@@ -438,9 +436,9 @@ agent 发一条简短消息(根据用哪个 tier 微调措辞):
 
 ### CLI 调用形态(batch_runner 自动构造,不用 agent 手写)
 
-`python image_gen.py --prompt-file X --refs a.png,b.png --out C --meta-out M --size S --quality Q --no-invariants`
+`python image_gen_hybrid.py --prompt-file X --refs a.png,b.png --out C --meta-out M --size S --quality Q --no-invariants`
 
-`--no-invariants` = 不在 image_gen 调用前注入 `_config.py.QUALITY_INVARIANTS` 文本块。**注**: 2026-05-14 之后 batch_runner 已在 image_gen 前跑了 vision + rewrite step,rewrite 输出的英文 prompt 已通过 system prompt 教 LLM 遵守 QUALITY 规则;再在 image_gen 前注入一次会双重灌指令、稀释 prompt budget,故 batch UX 仍传 `--no-invariants`(由 rewrite layer 接管 quality 约束)。
+`--no-invariants` = **legacy CLI flag**, 兼容 main 分支 image_gen.py 的 QUALITY_INVARIANTS 注入开关。**hybrid path 无 invariants 注入机制** — quality 规则在 rewriter system prompt 里教 LLM, 而不是 image_gen 调用前文本注入。batch_runner 仍传该 flag (noop + warn). 未来 batch_runner / scheduler 不应再传它。
 
 ### 支持的形态（28 raw case 验证矩阵覆盖）
 
@@ -461,16 +459,16 @@ batch UX **不预设图片角色**——`reference_images` 就是一个有序列
 
 **✅ batch_runner 自动做的事**（agent 不要重复）：
 
-- ✅ Per-task vision + rewrite：`batch_runner` 调 `scripts/rewrite_prompt.py` 对每个 task 跑 vision + LM rewrite，把中文需求转成 N 段（N=task.n）英文 image-gen prompt。**agent 不要自己再 rewrite 一遍 / 不要在 config 里塞预 rewrite 好的英文 prompt**。**Invariant**：rewrite 强制走（已删 `--no-rewrite` / `prompt_already_rewritten` 等 bypass 旗子），失败时 batch 整批 fail-fast；`image_gen.py` 入口有 CJK 字符兜底闸（>10% 中文即拒）阻止任何 raw 中文 prompt 触达 API。
+- ✅ Per-task vision + rewrite：`batch_runner` 调 `scripts/rewrite_prompt.py` 对每个 task 跑 vision + LM rewrite，把中文需求转成 N 段（N=task.n）**中文 structured prompt with [Vision Notes] 块**。**agent 不要自己再 rewrite 一遍 / 不要在 config 里塞预 rewrite 好的 prompt**。**Invariant**：rewrite 强制走（已删 `--no-rewrite` / `prompt_already_rewritten` 等 bypass 旗子），失败时 batch 整批 fail-fast；`image_gen_hybrid.py` 入口走 SENTINEL 闸 (`# REWRITTEN-CN-V2`), 未通过 SENTINEL 走 raw 兜底入口 + warning (hybrid 路径没有 CJK 占比闸, rewriter 输出本就是中文不能拒)。
 - ✅ N 段不同主体：`rewrite_prompt` 一次产 N 段独立 prompt，每段 feature 不同主体角色（系列多样性）。**agent 不要假设"5 张同 prompt 跑 5 次 sampling"**。
-- ✅ No QUALITY_INVARIANTS double-injection：`batch_runner` 调 `image_gen.py` 时传 `--no-invariants`，因为 rewrite layer 已经在 system prompt 里约束了 quality 规则。
+- ✅ No legacy --no-invariants double-burn：`batch_runner` 调 `image_gen_hybrid.py` 仍传 `--no-invariants` (legacy 兼容 flag, hybrid noop), quality 规则由 rewriter system prompt 教 LLM 直接 enforce。
 
 **❌ agent 仍不要做的事**：
 
 - ❌ **不要** Pillow 后期叠字：image_gen 一次性把所有中文 text 画进图里。
 - ❌ **不要** 主动给 `config.tasks[].prompt` 加修饰词或英文化：用户填的中文需求传给 rewrite_prompt，LM 自己 rewrite。
 - ❌ **不要** 改 `reference_images` 顺序：顺序对应用户 prompt 里"图1/图2/图3"，照用户排的传给 rewrite_prompt。
-- ❌ **不要** 试 ToolSearch / 任何 runtime-provided ImageGen wrapper：batch UX 永远走 `scripts/image_gen.py`，跟 `scripts/rewrite_prompt.py` 配对。
+- ❌ **不要** 试 ToolSearch / 任何 runtime-provided ImageGen wrapper：batch UX 永远走 `scripts/image_gen_hybrid.py`，跟 `scripts/rewrite_prompt.py` 配对。
 - ❌ **不要** 主动开多个 batch 并发跑同 task：token 翻倍且无质量提升。
 - ❌ **不要** 主动重发触发短语 / 重启 batch_runner：1 个 config 对应 1 个 batch_runner 进程,重启会让多进程同写文件 race。如果 batch 看着卡了,先 tail log / check `_batch_meta.json` 而非盲重启。
 
@@ -490,6 +488,10 @@ Phase 2: poll `{batch_id}_anchor_picks.json` (30s/round, timeout 30min);user 浏
 Phase 3: copied picked → `{task_id}_01.png` + rewrite N-1 段 anchor-locked → 跑 N-1 张 series
 ```
 
+**🚨 Phase 3 主角身份 LOCK** (hybrid path 反转旧 main bug):
+- 旧 main 路径 Phase 3 描述 "angle/sidekick may vary" 实际让**主角身份**也 vary (实测旧版 series 跨张主角变成完全不同的另一个角色)
+- hybrid path 改为**主角身份严格 LOCK**: N-1 段 rewrite 都跟 picked anchor 保持同一主角, 只 vary pose/scene/小道具. 这条 invariant 写在 `rewrite_prompt.py` anchor_phase="phase3" 段的 system prompt 里
+
 **🚨 Phase 2 — agent 绝对不能代办**:
 
 agent 看到 `_batch_meta.json` 内 `status="awaiting_picks"` = 等用户挑选的标志,不是卡死。
@@ -507,14 +509,14 @@ agent 看到 `_batch_meta.json` 内 `status="awaiting_picks"` = 等用户挑选�
 
 ## 图片迭代修改（基于已生成图再加工）
 
-设计师跑完一批后看 `result_grid.html`,想"第 3 张头改一下 / 第 5 张文字改一下 / 这张作为新参考再做 2 张变体"——技术基础已 free,**`gpt-image-2 /v1/images/edits` 端点天然支持把任意已生成 PNG 当下次 input**(把它写到 task 的 `reference_images` 列表就行,不区分"原图"还是"AI 生成图")。
+设计师跑完一批后看 `result_grid.html`,想"第 3 张头改一下 / 第 5 张文字改一下 / 这张作为新参考再做 2 张变体"——技术基础已 free,**`/v1/responses` + `image_generation` tool 端点天然支持把任意已生成 PNG 当下次 input**(把它写到 task 的 `reference_images` 列表就行,不区分"原图"还是"AI 生成图")。
 
 三种典型迭代场景:
 
 **场景 1 — 单张图局部修改**(改头 / 改文字 / 改气泡)
 - 用户在 result_grid 里点开第 3 张,拿到路径 `<out_dir>/t03_01.png`
 - 用户回表单建新 batch,task 的 `reference_images = ["<out_dir>/t03_01.png", "<新角色参考图>"]`, `prompt = "把这张图的主角头部换成图2里识别出的角色形象,其他保持"`
-- batch_runner 把 ref_images 全发给 `/v1/images/edits`,image_gen 自己识别"主图 + 参考图"语义
+- batch_runner 把 ref_images 全发给 `/v1/responses` + `image_generation` tool, image model 自己识别"主图 + 参考图"语义
 
 **场景 2 — 用已生成图当风格 anchor 再做 N 张系列**
 - 用户拿满意的第 5 张当 series anchor: `reference_images = ["<out_dir>/t05_01.png"]`, `prompt = "保持这张图的画风/配色/版式,改成另一个角色 X 的版本",n = 3`
@@ -549,7 +551,7 @@ agent 看到 `_batch_meta.json` 内 `status="awaiting_picks"` = 等用户挑选�
 
 ### Agent 行为：First-time setup（零负担推广路径）
 
-如果 `scripts/image_gen.py` 报错 `RuntimeError: 缺 API key`，agent **必须**按以下流程处理（不要假设用户懂环境变量 / 不要让用户去翻系统设置）：
+如果 `scripts/image_gen_hybrid.py` 报错 `RuntimeError: 缺 API key`，agent **必须**按以下流程处理（不要假设用户懂环境变量 / 不要让用户去翻系统设置）：
 
 1. **问用户一次**(用用户的母语，对设计师友好措辞):
    > "我需要你的 ephone API key 才能跑这个 skill。请把 key 贴在对话里(以 `sk-` 开头)，我会帮你保存到本机配置文件 `~/.config/game-ad-imagegen/config.toml`，以后自动用，不用再问。"
@@ -562,7 +564,7 @@ agent 看到 `_batch_meta.json` 内 `status="awaiting_picks"` = 等用户挑选�
      ```
    - 如果 user 贴的 key 是真 OpenAI key（`sk-proj-...` 前缀 / 已知是 platform.openai.com 的）→ 改写 `openai_api_key = "..."` + `openai_base_url` 字段缺省（让 SDK 走 OpenAI 默认）
 4. **不要**在 chat 里 echo 完整 key（确认收到说"已保存"即可）。
-5. **重新跑** `python scripts/image_gen.py ...` — `_config.py.load_credentials()` 会自动读到 config.toml，不需要重启 WorkBuddy / 不需要设 env。
+5. **重新跑** `python scripts/image_gen_hybrid.py ...` — `_config.py.load_credentials()` 会自动读到 config.toml，不需要重启 WorkBuddy / 不需要设 env。
 
 ### 手动配置(给已经懂的开发者参考)
 
