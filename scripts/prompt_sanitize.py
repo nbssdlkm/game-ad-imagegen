@@ -70,7 +70,8 @@ _SIZE_NEARBY_ANCHORS = re.compile(
     r"宽|高|配图|要|长方形|正方形|做|生成|图"
 )
 
-# 关键字 → 比例 hint
+# 关键字 → 比例 hint. 必须在 instructional context (前后有 size/做/生成/图 等
+# anchor 词) 才采纳, 避免 verbatim 文本"竖版排列五位角色" 误推 9:16 (round-5 blind #7)
 ORIENTATION_KEYWORDS = {
     "竖版": (9, 16),
     "竖屏": (9, 16),
@@ -82,6 +83,11 @@ ORIENTATION_KEYWORDS = {
     "square": (1, 1),
 }
 
+# Orientation 关键字附近的 anchor 词 — 必须 ±10 char 内有这些之一才采纳
+_ORIENTATION_NEARBY_ANCHORS = re.compile(
+    r"尺寸|画幅|比例|做|生成|生|出|要|输出|画面|图(?!片|案)|aspect|orientation"
+)
+
 
 def _round_to_multiple_of_16(n: int) -> int:
     """Round n 到最近的 16 的倍数,保留合规."""
@@ -89,6 +95,10 @@ def _round_to_multiple_of_16(n: int) -> int:
 
 
 # ephone image_gen tool 接受的常见合规尺寸 (codex image-api.md line 30-39)
+# 选取规则: 全部 ÷16 + 总像素在 [655K, 8.3M] + 比例 ≤3:1
+# `_DEFAULT_SHORT_EDGE = 1152` 来自 (16,9)/(9,16) 选项的短边 — 跟 codex 推荐的
+# "2K landscape 2048x1152" 同源, 兼顾质量 (>2M 像素) 和成本
+_DEFAULT_SHORT_EDGE = 1152
 COMMON_SIZES = {
     (1, 1): "1024x1024",
     (16, 9): "2048x1152",
@@ -98,9 +108,10 @@ COMMON_SIZES = {
 }
 
 
-def _aspect_to_size(w: int, h: int, target_short: int = 1152) -> str:
+def _aspect_to_size(w: int, h: int, target_short: int = _DEFAULT_SHORT_EDGE) -> str:
     """根据宽高比算合规 size (÷16 + ≤3840 边 + 总像素在 [655K, 8.3M])。
-    target_short 默认 1152 → 16:9 出 2048x1152 / 9:16 出 1152x2048 跟 COMMON_SIZES 一致。"""
+    target_short 默认 1152 (= _DEFAULT_SHORT_EDGE) — 让 16:9 出 2048x1152 / 9:16 出 1152x2048
+    跟 COMMON_SIZES 一致 (codex 推荐 2K landscape, ~2.4M 像素质量)."""
     gcd_val = _gcd(w, h)
     w_norm, h_norm = w // gcd_val, h // gcd_val
 
@@ -149,9 +160,9 @@ def _extract_and_normalize_size(text: str) -> tuple[str | None, str, str | None,
             else:
                 w_rounded = _round_to_multiple_of_16(int(3840 * w_rounded / h_rounded))
                 h_rounded = 3840
-        # 校验比例 <= 3:1
+        # 校验比例 ≤ 3:1 (codex image-api.md 硬约束: "Long edge to short edge ratio must not exceed 3:1")
         if max(w_rounded, h_rounded) / min(w_rounded, h_rounded) > 3:
-            return None, f"显式 {w}x{h} 比例 >3:1 不合规", None, False
+            return None, f"显式 {w}x{h} 比例 >3:1 ephone 拒绝 (codex spec)", None, False
         # 校验 total pixels >= 655360 (ephone gpt-image-2 min pixel), 不够则按比例 upscale
         total = w_rounded * h_rounded
         upscaled = False
@@ -178,10 +189,15 @@ def _extract_and_normalize_size(text: str) -> tuple[str | None, str, str | None,
             w, h = int(m.group(1)), int(m.group(2))
             return _aspect_to_size(w, h), f"宽高比 {w}:{h} ({kind})", None, False
 
-    # Step 3: 关键字
+    # Step 3: 关键字 — 必须在 instructional context (附近 ±10 char 有 size/做/生成 等 anchor 词)
+    # 避免 verbatim 文本"竖版排列五位角色"误推 9:16
     for kw, (w, h) in ORIENTATION_KEYWORDS.items():
-        if kw in text:
-            return _aspect_to_size(w, h), f"关键字 '{kw}' → {w}:{h}", None, False
+        for m in re.finditer(re.escape(kw), text):
+            start, end = m.span()
+            window = text[max(0, start - 10):min(len(text), end + 10)]
+            if _ORIENTATION_NEARBY_ANCHORS.search(window):
+                return _aspect_to_size(w, h), f"关键字 '{kw}' (有 anchor context) → {w}:{h}", None, False
+        # 该 kw 出现但无 anchor → 继续找下一 kw
 
     return None, "未提取到 size hint", None, False
 
@@ -207,11 +223,13 @@ def sanitize_post_rewrite(prompt: str) -> tuple[str, dict]:
     else:
         info["sentinel_ok"] = True
 
-    # SENTINEL 通过 → 信任 rewriter 输出, 不再跑 _negate_to_positive (避免双重 regex sub
-    # 把 rewriter 写的正向指令再 substitute 一遍). 只 strip 显式批量数字词 (rewriter 偶发漏).
-    cleaned = _strip_batch_words(prompt)
+    # SENTINEL 通过 → 信任 rewriter 输出, **不再跑任何 regex sub** (round-5 blind #5):
+    # _strip_batch_words 会破坏 rewriter [文字 verbatim] 段里合法的中文广告字面
+    # (如 "做5张挑战"), 违反 rewriter 输出 invariant "verbatim text must survive".
+    # rewriter system prompt Rule 3 已要求 LLM 自己删批量控制语言, 不需要这里再 sub.
+    cleaned = prompt
 
-    # Size 提取 (从原 prompt 而非 cleaned, 避免清洗破坏数字)
+    # Size 提取 (从原 prompt, 含 anchor check 防 verbatim 文本 leak)
     size, source, target, upscaled = _extract_and_normalize_size(prompt)
     info["size"] = size
     info["size_source"] = source
