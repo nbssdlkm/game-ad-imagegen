@@ -38,24 +38,10 @@ from prompt_sanitize import (  # noqa: E402
     SENTINEL, validate_rewritten,
     sanitize_post_rewrite, sanitize_raw_user_prompt,
 )
+from _credentials import load_credentials as _load_credentials  # noqa: E402
 
 DEFAULT_MODEL = "gpt-5.4"
 DEFAULT_REASONING = "medium"
-
-
-def _load_credentials() -> tuple[str, str]:
-    """ephone env-based credentials, friendly error if missing."""
-    key = os.environ.get("EPHONE_API_KEY")
-    if not key:
-        raise SystemExit(
-            "EPHONE_API_KEY 未设置。请在系统 env 配置:\n"
-            "  Windows: setx EPHONE_API_KEY \"sk-...\"  (重开终端生效)\n"
-            "  Linux/Mac: export EPHONE_API_KEY=\"sk-...\""
-        )
-    base = os.environ.get("EPHONE_BASE_URL", "https://api.ephone.ai")
-    if not base.endswith("/v1"):
-        base = base.rstrip("/") + "/v1"
-    return base, key
 
 
 def _encode_image(p: Path) -> str:
@@ -273,8 +259,11 @@ def main():
                 target_ratio = tw / th
                 actual_ratio = aw / ah
                 ratio_diff = abs(target_ratio - actual_ratio) / target_ratio
+                # 比例差 <5% (容差 ÷16 round 引入的微小比例偏移) + 某轴超 target 1.5x
+                # → 判定为 upscale case (sub-655K user request 被 ephone 放大到 ≥1024 短边),
+                # 走 LANCZOS downsize 回 user 期望. 比例差 >5% 或者尺寸跟 target 接近
+                # → 走 round case, center crop (跟 ÷16 round 引入的小幅尺寸差兼容)
                 if ratio_diff < 0.05 and (aw > tw * 1.5 or ah > th * 1.5):
-                    # upscale case: 比例一致 + actual 比 target 大 1.5x 以上 → LANCZOS downsize
                     im.resize((tw, th), Image.LANCZOS).save(out_path)
                     meta["post_resized"] = {"from": meta["actual_size"], "to": target_size, "method": "LANCZOS"}
                     print(f"  ↘ post-resize {aw}x{ah} → {target_size} (LANCZOS, 保 user 期望 size)", flush=True)

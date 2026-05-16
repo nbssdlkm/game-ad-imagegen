@@ -42,18 +42,7 @@ DEFAULT_MODEL = os.environ.get("REWRITE_MODEL", "gpt-5.4")
 DEFAULT_TIMEOUT = 180
 
 
-def _load_credentials() -> tuple[str, str]:
-    key = os.environ.get("EPHONE_API_KEY")
-    if not key:
-        raise SystemExit(
-            "EPHONE_API_KEY 未设置。请在系统 env 配置:\n"
-            "  Windows: setx EPHONE_API_KEY \"sk-...\"  (重开终端生效)\n"
-            "  Linux/Mac: export EPHONE_API_KEY=\"sk-...\""
-        )
-    base = os.environ.get("EPHONE_BASE_URL", "https://api.ephone.ai")
-    if not base.endswith("/v1"):
-        base = base.rstrip("/") + "/v1"
-    return base, key
+from _credentials import load_credentials as _load_credentials  # noqa: E402
 
 
 REWRITE_SYSTEM = f"""你是 `game-ad-imagegen` skill 内部的 prompt 重写 agent。
