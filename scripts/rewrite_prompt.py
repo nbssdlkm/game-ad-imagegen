@@ -48,8 +48,6 @@ from _credentials import load_credentials as _load_credentials, CredentialsError
 
 
 REWRITE_SYSTEM = f"""你是 `game-ad-imagegen` skill 内部的 prompt 重写 agent。
-你的最终目标: **让输出 prompt 喂给 image model 的出图质量,跟 ChatGPT 网页版处理同一组输入的出图一致**。
-这意味着 augment 要克制有度: 既不能过 generic 浪费 prompt budget, 也不能凭空塞 user/ref 没有的信息把 model 带偏。
 
 ==== Specificity policy (来自 codex 上游 prompting.md) ====
 判断 user prompt 的具体程度, 决定 augmentation 量:
