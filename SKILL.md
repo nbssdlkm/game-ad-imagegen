@@ -3,7 +3,7 @@ name: game-ad-imagegen
 description: |
   生成**游戏买量广告图 / 海报 / 买量素材**(特化场景)。当用户提供「爆款参考图 + 实机图 + 中文 prompt」请你做 N 张游戏广告系列图时使用。
   Hybrid path (2026-05-16): 调用 `/v1/responses` + `image_generation` tool (跟 ChatGPT 网页版同源, 一体化 vision + 生图), model `gpt-5.4 + reasoning_effort=medium`, 默认 size `2048x1152` (16:9, ÷16 合规). 由 `rewrite_prompt.py` 输出**中文 structured prompt** (codex labeled-lines 模板 + 强制 `[Vision Notes]` 块反 hallucination), 经 `prompt_sanitize.py` 兜底层 (SENTINEL 验 / size auto-fit / 否定→正向) 送 `image_gen_hybrid.py`. 任意 user 期望 size 都能 honor (1920x1080 → ephone ÷16 round 1920x1088 → PIL center crop 回 1080 / 650x250 banner < 655K 像素 → ephone upscale 到 2624x1024 → LANCZOS resize 回 user 期望). 题材无关 / 角色无关。非游戏广告题材请走 codex-imagegen-fork。
-  **跟 `codex-imagegen-fork` (B skill) 的差异化**:A 专做游戏买量广告(爆款复刻 + 多张系列 + 6 步 vision 工作流);B 做通用图片任务(单图修改 / 0 图文生图 / 任意题材)。设计师如果是"复刻爆款 + 出 N 张系列广告图"走 A;如果是"通用修图 / PS 一下 / 纯文字生一张"走 B。
+  **跟 `codex-imagegen-fork` (B skill) 的差异化**:A 特化在**工作流**(爆款复刻 + 多张系列 + vision verify + anchor LOCK 主角身份不漂),**画面题材完全无关** — 输入是什么题材就出什么题材(三国/二次元/SLG/水墨/写实皆可);B 是通用图片任务(单图修改 / 0 图文生图 / 任意题材, 无 anchor workflow)。设计师"复刻爆款 + 出 N 张系列"走 A;"通用修图 / PS 一下 / 纯文字生一张"走 B。
   触发词:复刻这张爆款图给我们游戏 / 做几张游戏广告图 / 学这张图做几张类似的 / 游戏海报生成 / 买量素材 / 任意题材的游戏广告图复刻 / 出 N 张系列广告图。
 ---
 
@@ -11,7 +11,7 @@ description: |
 
 ## 🚨 Hard Invariant — 必读
 
-**进入 image API 的每一个 prompt 必须由 `scripts/rewrite_prompt.py` 产出，无任何 bypass**。没有这条，出图质量退回 case_22 的中文 prompt 幻觉模式，skill 失去意义。
+**进入 image API 的每一个 prompt 必须由 `scripts/rewrite_prompt.py` 产出，无任何 bypass**。没有这条，agent 自己手写 prompt 会幻觉一个跟参考图毫无关系的内容 (历史失败模式), skill 失去意义。
 
 `scripts/image_gen_hybrid.py` 入口校验:
 - **SENTINEL marker 校验** — prompt 第一行必须是 `# REWRITTEN-CN-V2`（由 `rewrite_prompt.py` 自动加在每段产出的开头）。缺标记 → 走 `sanitize_raw_user_prompt` 兜底入口 + warning. (hybrid 路径**没有** CJK 字符占比闸 — rewriter 输出本身就是中文, 不能用 CJK 占比拒)
@@ -45,7 +45,7 @@ LLM agent 检测到下列条件命中时启动 skill：
 2. 用户 prompt 中含"广告图 / 海报 / 买量素材 / 复刻 / 学这张图 / 做 N 张类似的 / 改文案 / 把图1改成 X" 或同义 / 类似词
 3. 输出张数 N ≥ 1（"做 1 张" / "做 5 张" 都支持）
 
-**支持的形态**（28 raw case 验证）：1 张图改文案 / 2 张爆款风格融合 / 3 张含 UI+文字+角色头像迁移 / 5+ 张实机图自由组合 — 都走 A skill；图的角色（参考 / 素材 / 叠加目标）由用户 prompt 描述 + vision 实际识别决定。
+**支持的形态**：1 张图改文案 / 2 张爆款风格融合 / 3 张含 UI+文字+角色头像迁移 / 5+ 张实机图自由组合 — 都走 A skill；图的角色（参考 / 素材 / 叠加目标）由用户 prompt 描述 + vision 实际识别决定。
 
 **0 图模式**：用户给 0 张参考图 + 纯文字描述游戏买量素材（如"做一张三国主题游戏 banner，主标题立即下载"），hybrid 不切端点 — `/v1/responses` + `image_generation` tool 同样接受 0 图 (refs 为空数组), text2im 模式仍走 rewrite_prompt + SENTINEL 单闸。Anchor mode 不支持 0 图（vision verify 需要图）。**非游戏广告题材**（产品照 / 企业 logo / 真实摄影 / infographic 等通用任意题材）→ B skill `codex-imagegen-fork`，那边的 system prompt 是 generic taxonomy 不会强加买量风格。
 
@@ -89,7 +89,7 @@ agent 在 Step 4 装配 prompt 时遵守以下 quality 约束 (hybrid path 由 r
 
 🚨 **强制 vision verification（防 hallucinated prompt）**
 
-1. **真的看图**——必须用你（agent）的 multimodal vision 能力 / `view_image` tool / image read tool **实际加载每张参考图的 bytes** 到 conversation context。**不能**凭文件路径名（如 `ref_image_a.png` / `game_image_b.png`）、case_id、用户原 prompt 里的题材词来"猜"图内容。
+1. **真的看图**——必须用你（agent）的 multimodal vision 能力 / `view_image` tool / image read tool **实际加载每张参考图的 bytes** 到 conversation context。**不能**凭文件路径名（如 `ref_image_a.png` / `game_image_b.png`）、用户原 prompt 里的题材词来"猜"图内容。
 2. **Verify see（强制输出）**——在写 StyleAnchor / CandidatePool 之前，**先用 1-2 句中文 plain description 列出每张图你实际看到的内容**（"图1：[实际看到的视觉描述，含题材/构图/UI/配色/角色性别外貌等可观察元素]"），让 user 能 verify 你是真看到了图，**不是凭训练先验幻觉**。如果你写不出具体的视觉细节（只写空泛的"a dramatic game-poster" / "a fantasy warrior" 这种没有 verify 价值），说明你没真读到图。
 3. **没 vision 能力的 model 不能跑此 skill**——如果你是纯文本模型（无 multimodal），**必须主动 stop**，告诉 user："我没有 vision 能力，请换有视觉的 model（Claude / GPT-4o+ / GLM-5V / Hy3 等）跑此 skill，或你自己描述每张图给我"。**不要硬撑**写 hallucinated prompt。
 4. **为什么强制**——历史失败模式:agent 跳过 vision call,凭训练先验幻觉一个跟实际参考图毫无关系的 prompt(题材完全错位、角色完全错位)。**根因 = Step 1 之前是 implicit vision 假设**;现在强制 explicit verify 把这条堵死。
@@ -169,55 +169,53 @@ python scripts/rewrite_prompt.py \
 
 **为什么 prompt 字面精度直接决定结果**：`image_gen_hybrid.py` 用 `/v1/responses` + `image_generation` tool 端点 — **prompt 字面 + refs 一起送给 image model, model 内部 vision + 生图一体化处理**。verbatim 中文准确度靠 rewrite 字面精度，scene complexity 直接决定 image model text 渲染 budget。
 
-#### 必须遵守的原则(case_24 / case_09 / case_04 跨场景验证)
+#### rewriter 内部规则 (供 agent 排错时理解 rewrite 行为)
 
-1. **单 hero focus**:1 个主体角色 + ≤2 个副角(inset 头像 / sidekick / 小兵反应)。不要堆 multi-panel 多场景 / 8+ text 位置 → 稀释 image model text 精度(case_24 实证)。
-2. **STRICTLY 4-5 个显式 Chinese text 位置**(标题 + 主 promotional banner + 角色 nameplate + speech bubble + 可选 small stamp)。<3 个空虚,**>5 个稀释**(2026-05-14 case_01 batch run 实证 — rewrite 输出 8 个文字位时画面明显拥挤、人物精致度被牺牲;网页版 ChatGPT 输出 6 个则留白合理)。Agent 写 prompt 时**保守裁剪,不确定就砍**。
-3. **每个中文 text 字面 quoted 列出**:写 `Large stylized title at top: "<游戏标题>"`(用实际中文字面,不是 `"the calligraphy title"` 这种英文描述,模型会留空白)。
-4. **每张图独立 labeling**:`Image 1 (<role from PerImageNotes>): <key_visuals>. Image 2 (<role>): ...` 每张图独立角色,**不要 collapse 成 "Image A primary style / Image B/C source" 二分**(case_15 形态偏见,对单图修改 / 多实机图 / 风格融合 有害)。
-5. **70% faithful 30% creative 显式写**:`Keep about 70% faithful to reference style, 30% creative variation`。
-6. **角色定位 + 视觉描述照贴 CandidatePool**:`Use the hero visually identified in Image <N>` + 服装色 / 武器 / 五官 / 标志特征。不凭训练先验幻觉用户没给的角色。
-7. **风格词从 Step 1 StyleSummary.整体氛围 取**(如 `polished 2D illustration` / `semi-realistic painterly CG` / `stylized concept art`),不从题材 lookup 取。
-8. **强约束**(加在 Quality and style requirements 段):
-   - `All Chinese text rendered crisply and readably DIRECTLY in the image`
-   - `Do NOT leave any text container blank`
-   - `Do NOT use placeholder pseudo-Chinese`
-   - `Do NOT use English subtitles`(防 GLM 等纯英文模型偏题)
-   - `No phone UI / FPS overlay / vConsole / watermark / app-store badges / blank text containers`
+下方是 `rewrite_prompt.py` 的 `REWRITE_SYSTEM` 内部规则摘要。**agent 不需要自己手抄这些规则手写 prompt** — rewriter LLM 已经按这些规则跑。贴在这里供 agent 排错 / 解释 rewriter 输出给用户:
 
-#### 绝对禁止
+1. **[Vision Notes] 强制开头**: rewriter 输出每段必须以 `[Vision Notes]` 块开头, plain 描述每张 ref 实际看到的内容 (反 hallucination). 看不出角色身份就写视觉特征 placeholder, 绝不凭训练先验猜具体历史人物 / franchise 角色名。
+2. **字位数量模仿 ref 字位密度**: 上限 5, 下限 = ref 实际字位数 (ref 0 字位则不渲染任何文字; ref 字位密集则截到 ≤5 个最关键). 字位语义功能跟 ref 一致 (ref 上原是 X 类信息 → 当前主角 X 类信息) — 不预设具体字位类型。
+3. **每字位 verbatim quoted**: 在 [文字 verbatim] 段每个字位写 `<位置>: "<exact 字面>"`. 不要含糊地说"主题文字"否则被 image model hallucinate。
+4. **每张 ref 独立 labeling**: 每张 ref 在 [参考图角色] 段独立 line + role (composition reference / character source / style reference / edit target 等, 自由文本), 不 collapse 成"主图 / 副图"二分。Ref 顺序按 user "图1/图2/..."语义, 不靠文件名字母序。
+5. **70/30 faithful/creative**: rewriter system prompt 显式写 "保留约 70% ref 视觉, 30% 创作自由发挥"。
+6. **风格词从 vision 抽**: rewriter 描述风格用 vision 看到的笔触/材质/光影/线条, **不写任何 franchise/IP/题材名先验**。
+7. **装饰图形语言保留 + 文字 verbatim 不复制**: 避免段只禁 ref 文字 verbatim 内容, 装饰图形 (按 [Vision Notes] 列出的装饰元素) 必须复刻形态. 不能写"不要复制 ref 上的所有视觉元素"这种过广避免 — 会让 image model strip 装饰导致出图比 ref 简陋。
+8. **题材完全无关**: rewriter 对任何题材 (三国/二次元/SLG/魔幻/科幻/水墨/写实/概念原画/赛博朋克/抽象艺术等) 都按 ref 实际 vision 输出, 不预设任何题材偏好。
 
-- 在 prompt 里写 `Text (verbatim): none. Leave blank.` 或 `no Chinese characters` → 留白叠字反模式
-- 写 `do NOT render readable words` 反向指令 → agent 没读到图时保守留空白
-- 写任何题材 hardcoded lookup → 失普适性
-- 把 Step 1 vision 没看到的元素塞进 prompt → 凭空发明
-
-#### Ready-to-use 骨架(跨场景验证 0 错字,不用查外部模板)
+#### Rewriter 输出格式 (中文 labeled lines, 单段示例)
 
 ```
-Create a polished {orientation} {asset type} in {WxH}, aspect ratio {ratio}.
-Image 1 (<role: e.g. "style+构图 anchor" / "角色源" / "UI 模板" / "改文案目标">): {describe what Image 1 actually shows — from Step 1 PerImageNotes.key_visuals}.
-Image 2 (<role>): {describe what Image 2 actually shows}.
-{... add one line per reference image, each with its role from PerImageNotes ...}
+# REWRITTEN-CN-V2
+[Vision Notes]
+- Image 1: <plain 描述>
+- Image 2: <plain 描述>
+- ...
+[/Vision Notes]
 
-Design a brand-new composition echoing the style anchor image's visual language while
-adapting to {orientation/ratio}. Keep about 70% faithful, 30% creative.
-
-Main content requirements:
-- {Central hero: 视觉描述 + pose}
-- {Background: atmosphere + key props}
-- Large stylized title at top in {style}: "{TITLE}".
-- Main promotional banner: "{MAIN_TEXT}".
-- {Optional speech bubble}: "{BUBBLE_TEXT}".
-- {Optional small inset/stamp}: "{SIDE_TEXT}".
-
-Quality and style requirements:
-- All Chinese text rendered crisply and readably DIRECTLY in the image.
-- Do NOT leave any text container blank / use placeholder pseudo-Chinese / use English subtitles.
-- No raw screenshot artifacts / phone UI / FPS / watermarks / app-store badges.
-- {Polished commercial finish, specific style notes from StyleSummary}.
-- {Orientation} composition only, {WxH}.
+用途: <一句话功能用途, 自由文本不预设 enum>
+主要请求: <一句话讲这张图要什么>
+参考图角色:
+  - Image 1 (<role>): <vision 看到的 + 在本段 prompt 怎么用>
+  - Image 2 (<role>): <同上>
+场景/背景: <氛围 + 关键 props + 来源>
+主角主体: <具体描述 + pose + 跟 ref 的关系>
+画风/介质: <从 vision 提取的笔触/材质/光影/调色板, 不写 franchise/IP/题材名>
+构图/比例/尺寸: <横/竖版 + 宽高比 + 尺寸 + 留白>
+文字 (verbatim, 字位数模仿 ref 密度, 上限 5):
+  - <位置 1>: "<引号内 exact verbatim>"
+  - ...
+约束: <从 user 否定指令转成正向 + 通用 quality 约束>
+避免: <hallucination 黑名单: 不要拼图 / 不要 panel / 不要从 ref 复制 verbatim 文字>
 ```
+
+多段 (N>1) 用单独一行 `---PROMPT-SEP---` 分隔。每段独立 self-contained。
+
+#### 绝对禁止 (agent 跟 rewriter 都不能做)
+
+- 不要让 agent 自己手写 prompt 然后塞给 image_gen_hybrid (绕开 rewriter vision verify)
+- 不要写"留空叠字"反模式 (image_gen 一次性画字)
+- 不要凭训练先验幻觉用户没给的角色 (rewriter [Vision Notes] 已强制 anti-hallucination)
+- 不要做任何题材 hardcoded lookup
 
 ---
 
@@ -438,22 +436,22 @@ agent 发一条简短消息(根据用哪个 tier 微调措辞):
 
 `python image_gen_hybrid.py --prompt-file X --refs a.png,b.png --out C --meta-out M --size S --quality Q --no-invariants`
 
-`--no-invariants` = **legacy CLI flag**, 兼容 main 分支 image_gen.py 的 QUALITY_INVARIANTS 注入开关。**hybrid path 无 invariants 注入机制** — quality 规则在 rewriter system prompt 里教 LLM, 而不是 image_gen 调用前文本注入。batch_runner 仍传该 flag (noop + warn). 未来 batch_runner / scheduler 不应再传它。
+`--no-invariants` = **legacy CLI flag** (hybrid 实现里 noop + warn)。保留只为兼容 batch_runner.py 现有调用,以后清理 batch_runner 时一并删。quality 规则全在 rewriter system prompt 里教 LLM enforce, 无 image_gen 调用前文本注入机制。
 
-### 支持的形态（28 raw case 验证矩阵覆盖）
+### 支持的形态
 
 batch UX **不预设图片角色**——`reference_images` 就是一个有序列表，每张图的用途由用户的 prompt 自己描述。下表只列典型场景做参考，**不是 schema 约束**：
 
-| 实际形态 | 例 | 用户 prompt 里通常怎么写 |
-|---|---|---|
-| 1 张图 | case_05 | "把文案 X 改成 Y" — 单图修改 |
-| 2 张图（都是爆款） | case_24 | "根据这两张趣味图，生成乐不思蜀的趣味图" — 风格融合 |
-| 3 张图（爆款+实机） | case_15 | "将图1的UI和文字加到图2上，图3角色作头像" — 显式指定每张用途 |
-| 5+ 张图（全实机） | case_09 / case_10 / case_19 | "这是游戏截图，选元素做宣传图" — 让模型自由组合 |
+| 实际形态 | 用户 prompt 里通常怎么写 |
+|---|---|
+| 1 张图 | "把文案 X 改成 Y" — 单图修改 |
+| 2 张图（都是爆款） | "根据这两张趣味图，生成 X 主题的趣味图" — 风格融合 |
+| 3 张图（爆款+实机） | "将图1的UI和文字加到图2上，图3角色作头像" — 显式指定每张用途 |
+| 5+ 张图（全实机） | "这是游戏截图，选元素做宣传图" — 让模型自由组合 |
 
-### A skill 不支持（明确 reject）
+### 0 图模式
 
-- **0 张图（纯文字生图 text2im）**：A v0.1.3 起支持，走 `/v1/images/generations` 端点。仍走 rewrite_prompt + SENTINEL/CJK 双闸。case_20 这种"生成第一人称视角的古代战场..."的纯描述请求现在 A 能跑。**Anchor mode 不支持 0 图**（vision verify 需要图，0 图请求自动落 standard mode）
+hybrid path `/v1/responses` + `image_generation` tool 同样接受 0 图 (refs 为空, text2im 模式), 仍走 rewrite_prompt + SENTINEL 闸。"生成第一人称视角的古代战场" 这种纯描述请求 A 能跑。**Anchor mode 不支持 0 图**（vision verify 需要图，0 图请求自动落 standard mode）
 
 ### Batch UX 模式下 agent 的边界（2026-05-14 重写，跟 scripts/ 对齐）
 
@@ -551,7 +549,7 @@ agent 看到 `_batch_meta.json` 内 `status="awaiting_picks"` = 等用户挑选�
 
 ### Agent 行为：First-time setup（零负担推广路径）
 
-如果 `scripts/image_gen_hybrid.py` 报错 `RuntimeError: 缺 API key`，agent **必须**按以下流程处理（不要假设用户懂环境变量 / 不要让用户去翻系统设置）：
+如果 `scripts/image_gen_hybrid.py` exit code 2 + stderr 报 `! credentials missing: ...` (`_credentials.CredentialsError`),agent **必须**按以下流程处理(不要假设用户懂环境变量 / 不要让用户去翻系统设置):
 
 1. **问用户一次**(用用户的母语，对设计师友好措辞):
    > "我需要你的 ephone API key 才能跑这个 skill。请把 key 贴在对话里(以 `sk-` 开头)，我会帮你保存到本机配置文件 `~/.config/game-ad-imagegen/config.toml`，以后自动用，不用再问。"
@@ -564,7 +562,7 @@ agent 看到 `_batch_meta.json` 内 `status="awaiting_picks"` = 等用户挑选�
      ```
    - 如果 user 贴的 key 是真 OpenAI key（`sk-proj-...` 前缀 / 已知是 platform.openai.com 的）→ 改写 `openai_api_key = "..."` + `openai_base_url` 字段缺省（让 SDK 走 OpenAI 默认）
 4. **不要**在 chat 里 echo 完整 key（确认收到说"已保存"即可）。
-5. **重新跑** `python scripts/image_gen_hybrid.py ...` — `_config.py.load_credentials()` 会自动读到 config.toml，不需要重启 WorkBuddy / 不需要设 env。
+5. **重新跑** `python scripts/image_gen_hybrid.py ...` — `_credentials.load_credentials()` 会自动读到 `~/.config/game-ad-imagegen/config.toml` (路 3 fallback)，不需要重启 WorkBuddy / 不需要设 env。
 
 ### 手动配置(给已经懂的开发者参考)
 
