@@ -414,7 +414,7 @@ def rewrite(user_prompt: str, reference_images, n: int = 1,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--user-prompt-file", required=True)
-    ap.add_argument("--refs", required=True)
+    ap.add_argument("--refs", default="", help="逗号分隔的参考图路径; 空 = 0-image text2im 模式 (走纯文字生图, SKILL.md L56/L463 明确支持)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--n", type=int, default=1)
     ap.add_argument("--model", default=None)
@@ -424,7 +424,9 @@ def main():
     args = ap.parse_args()
 
     user_prompt = Path(args.user_prompt_file).read_text(encoding="utf-8")
-    refs = [Path(p) for p in args.refs.split(",")]
+    # Filter empty path strings — `--refs ""` 或 `--refs a.png,` 跳空段, 避免 Path('') 等于 '.' 时
+    # _encode_image(Path('.')) 跑 open('.', 'rb') → PermissionError (round-7 case_20 实测抓的真 bug)
+    refs = [Path(p) for p in args.refs.split(",") if p.strip()]
     for p in refs:
         if not p.exists():
             print(f"! ref not found: {p}", file=sys.stderr)
