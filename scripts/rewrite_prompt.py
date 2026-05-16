@@ -40,6 +40,8 @@ from openai import OpenAI
 PROMPT_SEP = "---PROMPT-SEP---"
 SENTINEL = "# REWRITTEN-CN-V2"  # 跟 main 版 REWRITTEN-V1 区分
 
+# gpt-5.4 是 ephone gateway (https://api.ephone.ai/v1) 暴露的内部 model 名, 不是 OpenAI 公开模型;
+# 直连 OpenAI 时需 REWRITE_MODEL env 改成公开名 (e.g. gpt-4o / gpt-4.1) 否则 404
 DEFAULT_MODEL = os.environ.get("REWRITE_MODEL", "gpt-5.4")
 DEFAULT_TIMEOUT = 180
 
@@ -169,15 +171,16 @@ REWRITE_SYSTEM = f"""你是 `game-ad-imagegen` skill 内部的 prompt 重写 age
 9. **复刻 ref 视觉特征 + 不复制 ref 文字 verbatim**: image model 看 ref 时会把 ref 上的文字直接 copy 进新图。约束必须含 "do NOT copy any **text content** from reference images; only use text from the [文字 verbatim] section below"。**关键**: "避免"段**只禁文字 verbatim 内容**, **绝不能扩成"不要复制 ref 上的任何视觉特征"** — 过广避免会让 model 同时 strip ref 的视觉元素, 导致出图比 ref 简陋。正确写法: "不要复制 ref 上的 verbatim 文字内容; 复刻 ref 的视觉特征 (按 [Vision Notes] 里列出的视觉元素清单)"。
 10. **默认约束** (跟 codex 上游 sample-prompts 13 个 recipe 默认带的一致): 除非 user 显式说"要 logo / 要 watermark", 每段 prompt 的 [约束] 段必须含:
    - `no logos, no trademarks, no watermark` (所有 use case 通用)
-   - `no extra text outside [文字] section` (除 logo-brand / wordmark 等文字本身就是主体的 use case)
+   - `no extra text outside [文字] section` — **但 text-localization / identity-preserve / precise-object-edit 等 edit use case 要保留 ref 全部既有字位时本项失效** (改 X 不动其他, 其余字位都要 verbatim 保留, 否则跟 Rule 9 "复刻 ref 视觉特征" + Rule 2 "字位上限 5 截到关键" 在 ref 字位 >5 时互锁让 model 删 ref 既有字位); logo-brand / wordmark 等文字本身就是主体的 use case 同样豁免
    - 若 use case 是 photorealistic-natural → 加 `no studio polish, no staged look` 让 model 走自然摄影质感
    - 若 use case 是 ui-mockup / infographic-diagram → 加 `clear hierarchy, readable typography`
+   - **anchor_phase=phase3 时本 Rule 全部 use-case-specific 默认约束失效, 以 picked anchor 实际渲染风格为准** (e.g. anchor 本就 studio polish 时 phase3 不再加 "no studio polish" 反约束)。`no logos/trademarks/watermark` 通用项仍生效, edit use case 的 "no extra text 豁免" 也仍生效。
    这些默认约束**不算 augmentation 而算 normalization** — 是 codex 上游已 codify 的 baseline, 不算"凭空加细节"。
-11. **生僻字 / 英文人名 / 长数字串 letter-by-letter 处理**: image model 看 verbatim 字符串容易吞字 / 漏字 / 错字。文字位含以下任一情况时, 在该字位的 verbatim 内容后加 letter-by-letter 拆分注释:
-   - 生僻汉字 (e.g. "燚" / "鬵" / "蓥") → `"燚阳殿" (拆字: 燚-阳-殿)`
-   - 英文人名带 diacritic (e.g. "Müller" / "Naïve") → `"Müller" (拼字: M-ü-l-l-e-r)`
-   - 长数字串 ≥5 位 (e.g. "85618" / "135728") → `"85618" (数字: 8-5-6-1-8)`
-   - 中英混排短词 (e.g. "VIP特权" / "iOS版") → `"VIP特权" (拼字: V-I-P-特-权)`
+11. **长数字 / 中英混排 / 生僻字 / diacritic letter-by-letter 处理**: image model 看 verbatim 字符串容易吞字 / 漏字 / 错字。文字位含以下任一情况时 (按命中频率排序), 在该字位的 verbatim 内容后加拆分注释:
+   - 长数字串 ≥5 位 (高频 — 战力数值/抽奖码/账号): "99999 >> 188888" (数字: 9-9-9-9-9 ›› 1-8-8-8-8-8); "85618" (数字: 8-5-6-1-8)
+   - 中英混排短词 (中频 — UI 标签/版本号): "VIP特权" (拼字: V-I-P-特-权); "iOS版" (拼字: i-O-S-版)
+   - 生僻汉字 (低频): "燚阳殿" (拆字: 燚-阳-殿)
+   - 英文人名带 diacritic (极低频, game-ad 几乎不命中, 仅做完备性列出): "Müller" (拼字: M-ü-l-l-e-r)
    常见汉字 (e.g. "登录"/"领取"/"挑战") **不需要**拆分, 拆所有字会反向稀释 prompt budget。
 
 ==== Anchor 模式特殊处理 ====
@@ -190,6 +193,8 @@ REWRITE_SYSTEM = f"""你是 `game-ad-imagegen` skill 内部的 prompt 重写 age
   - refs 列表里 Image {{anchor_idx}} 是用户挑的 picked anchor (来自 Phase 1 候选)
   - 风格 LOCK 到 Image {{anchor_idx}}: 渲染技法/调色/排版/ref 的视觉特征 (按 [Vision Notes] 列出的视觉元素清单) 全部严格匹配
   - **主体 LOCK** (反转旧版 bug): 跟 picked anchor 同一主体身份, 不要换. 只 vary pose/场景/小道具。
+  - **字位密度 LOCK**: N-1 段的 [文字] 段密度跟 picked anchor 实际渲染的字位数对齐 (e.g. anchor 是无文字 splash → N-1 段也不渲染文字; anchor 有 3 个字位 → N-1 段也维持 3 个字位; 不能 phase1 anchor 空文字而 phase3 自由发挥加字位)。这跟 Rule 2 "字位上限 5" 共同 enforce: anchor 实际字位数 = phase3 字位数。
+  - **use-case-specific 默认约束失效** (跟 Rule 10 末项呼应): photorealistic-natural 的 "no studio polish" / ui-mockup 的 "clear hierarchy" 等条件约束在 phase3 都失效, 以 anchor 实际风格为准。
   - 每段 prompt 必须显式写: "严格匹配 Image {{anchor_idx}} 的渲染风格/调色/排版/视觉特征; 本张主体与 Image {{anchor_idx}} 保持同一身份, 只换 pose 和场景细节"
 
 ==== 输出格式 ====
@@ -225,6 +230,10 @@ def _encode_image(p: Path) -> dict:
 
 
 def _strip_fence(text: str) -> str:
+    """Strip outer markdown fence (` ```text\\n...\\n``` ` 包裹整段) + 任意位置的孤立 fence 行。
+    LLM 偶尔违反 system prompt "绝不要 markdown fences" 在 per-segment 加 ``` —
+    单纯 strip outer 不够 (会留段内残留 ``` 字符污染 segment content)。
+    """
     text = text.strip()
     if text.startswith("```"):
         lines = text.split("\n")
@@ -232,7 +241,9 @@ def _strip_fence(text: str) -> str:
         if lines and lines[-1].strip().startswith("```"):
             lines = lines[:-1]
         text = "\n".join(lines).strip()
-    return text
+    # Defense-in-depth: 剔掉任意位置的孤立 ``` 行 (per-segment fence 残留)
+    text = "\n".join(l for l in text.split("\n") if not l.strip().startswith("```"))
+    return text.strip()
 
 
 def _wrap_with_sentinel(prompt: str) -> str:
@@ -315,11 +326,16 @@ def rewrite(user_prompt: str, reference_images, n: int = 1,
     # 的 _TRANSIENT_STATUSES + 2-step backoff 一致, round-4 blind #6 抓).
     _TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
     _RETRY_BACKOFF_SEC = [5, 15]
-    attempts = [0] + _RETRY_BACKOFF_SEC
+    # attempts 用 list 而非 tuple, fallback 触发时可 append(0) 补回 retry slot
+    # (reasoning_unsupported 是 deterministic config error, 不该消耗 transient retry 预算)
+    attempts = [0] + list(_RETRY_BACKOFF_SEC)
     use_reasoning = True
     response = None
     last_exc = None
-    for attempt_idx, sleep_before in enumerate(attempts):
+    reasoning_fallback_done = False  # 防止 fallback 触发多次 (理论上一次后 use_reasoning=False 就不会再 hit)
+    attempt_idx = 0
+    while attempt_idx < len(attempts):
+        sleep_before = attempts[attempt_idx]
         if sleep_before > 0:
             print(f"  [rewrite-cn] retry attempt {attempt_idx + 1}/{len(attempts)} after {sleep_before}s...", file=sys.stderr, flush=True)
             time.sleep(sleep_before)
@@ -331,7 +347,7 @@ def rewrite(user_prompt: str, reference_images, n: int = 1,
             break
         except Exception as e:
             last_exc = e
-            # 检测"模型不支持 reasoning_effort"的 400 — 切到 no-reasoning 重试 (不算 transient retry)
+            # 检测"模型不支持 reasoning_effort"的 400 — 切到 no-reasoning 立即重试 (不消耗 transient retry slot)
             is_reasoning_unsupported = False
             try:
                 status = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
@@ -345,18 +361,24 @@ def rewrite(user_prompt: str, reference_images, n: int = 1,
                 emsg = str(e).lower()
                 if "reasoning" in emsg and any(s in emsg for s in ("unknown", "unsupported", "invalid", "400")):
                     is_reasoning_unsupported = True
-            if is_reasoning_unsupported and use_reasoning:
-                # 切到 no-reasoning + 让外层 loop 走下一轮 (用 backoff). 不再立即同步重试 —
-                # 避免烧 retry slot + 让 transient 检查只看 last_exc 这一个状态.
-                print(f"  [rewrite-cn] WARN: model={model} 不支持 reasoning_effort, fallback to no-reasoning (重试将在下一轮 backoff)", file=sys.stderr, flush=True)
+            if is_reasoning_unsupported and use_reasoning and not reasoning_fallback_done:
+                # Fallback to no-reasoning. 不消耗 retry slot — append 一个 0-sleep attempt 到末尾抵消本次消耗
+                # (R6-3 fix: 之前是 `continue` 让 attempt_idx 自然 +1, 等于 reasoning fallback 烧 1 个 transient retry 预算)
+                print(f"  [rewrite-cn] WARN: model={model} 不支持 reasoning_effort, fallback to no-reasoning (立即重试, 不消耗 retry slot)", file=sys.stderr, flush=True)
                 use_reasoning = False
-                continue  # 下一轮 attempt (会用 use_reasoning=False, 不带 backoff 因为 attempt_idx 没变 — 实际下次会带, 让 _RETRY_BACKOFF_SEC 决定)
+                reasoning_fallback_done = True
+                attempts.append(0)  # 补一个 0-sleep slot, 保 transient retry 预算不缩水
+                attempt_idx += 1
+                continue
             # 判断是否是 transient: HTTP status code in _TRANSIENT_STATUSES
             status_code = getattr(last_exc, "status_code", None) or getattr(getattr(last_exc, "response", None), "status_code", None)
             if status_code in _TRANSIENT_STATUSES:
+                attempt_idx += 1
                 continue  # 下一轮 backoff
             # 非 transient 直接抛
             raise
+        # 正常完成: while loop break 不应到这, 防御性 +1 防 infinite loop
+        attempt_idx += 1
     if response is None:
         raise last_exc if last_exc else RuntimeError("rewrite-cn unknown failure after retries")
 
@@ -396,7 +418,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--n", type=int, default=1)
     ap.add_argument("--model", default=None)
-    ap.add_argument("--anchor-phase", default=None, choices=[None, "phase1", "phase3"])
+    ap.add_argument("--anchor-phase", default=None, choices=["phase1", "phase3"])  # 缺省 = None (无 anchor 模式); argparse choices 不能含 None
     ap.add_argument("--anchor-idx", type=int, default=None)
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
